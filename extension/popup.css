@@ -1,7 +1,8 @@
-/* CNKI 工具书划词查询 - 弹窗样式
-   样式通过 content.js 中的 injectPopupStyles() 注入，
-   所有选择器以 #cnki-toolbook-popup 为作用域前缀，无需 !important。
-   此 CSS 文件仍通过 manifest 注入，作为后备（冗余注入被 injectPopupStyles 防止）。 */
+/*
+  CNKI 工具书划词查询 - 弹窗样式（后备）
+  主样式由 content.js 的 injectPopupStyles() 注入。
+  此处保留一份备份以便参考和直接查看。 */
+
 
 #cnki-toolbook-popup { all: initial; position: fixed; z-index: 2147483647; display: none; }
 
@@ -40,6 +41,9 @@
 #cnki-toolbook-popup .cnki-tb-word { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 4px; }
 
 #cnki-toolbook-popup .cnki-tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
+
+#cnki-toolbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
+#cnki-toolbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
 
 #cnki-toolbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
 

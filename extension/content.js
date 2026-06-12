@@ -82,6 +82,8 @@ function injectPopupStyles() {
     #${POPUP_ID} .cnki-tb-result-border { border-top: 1px solid #f0f0f0; }
     #${POPUP_ID} .cnki-tb-word { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 4px; }
     #${POPUP_ID} .cnki-tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
+    #${POPUP_ID} .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
+    #${POPUP_ID} .cnki-tb-book-link:hover { text-decoration: underline; }
     #${POPUP_ID} .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
     #${POPUP_ID} .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     #${POPUP_ID} .cnki-tb-tag {
@@ -144,8 +146,8 @@ function renderResults(results, x, y, keyword) {
           ${results.map((item, i) => `
             <div class="cnki-tb-result ${i > 0 ? 'cnki-tb-result-border' : ''}">
               <div class="cnki-tb-word">${escapeHtml(item.title)}</div>
-              <div class="cnki-tb-source">来源：《${escapeHtml(item.bookName)}》</div>
               <div class="cnki-tb-abstract">${escapeHtml(truncate(item.abstract, 200))}</div>
+              <div class="cnki-tb-source">来源：${item.readonlineUrl ? `<a class="cnki-tb-book-link" href="${escapeHtml(item.readonlineUrl)}" target="_blank" rel="noopener">《${escapeHtml(item.bookName)}》</a>` : `《${escapeHtml(item.bookName)}》`}</div>
               <div class="cnki-tb-meta">
                 ${item.subject ? `<span class="cnki-tb-tag">${escapeHtml(item.subject)}</span>` : ''}
                 ${item.citationCount ? `<span class="cnki-tb-citation">被引 ${item.citationCount} 次</span>` : ''}
