@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+</head>
+<body>
+<script>
+(function () {
+  // 沙箱页面：加载 SegmentIt（分词）与 OpenCC（繁简转换），不受宿主页面 CSP 限制，
+  // 通过 postMessage 与 content script 通信。两库独立加载、独立就绪，互不阻塞：
+  // 一库加载失败不影响另一库可用。
+
+  var segmenter = null;
+  var segmentitReady = false;
+  var openccConverter = null;
+  var openccReady = false;
+
+  // --- SegmentIt（智能分词） ---
+  var segScript = document.createElement('script');
+  segScript.src = 'https://cdn.jsdelivr.net/npm/segmentit@2.0.3/dist/umd/segmentit.js';
+  segScript.onload = function () {
+    try {
+      segmenter = new Segmentit.Segment();
+      Segmentit.useDefault(segmenter);
+      segmentitReady = true;
+      parent.postMessage({ type: 'cnki-segmentit-ready' }, '*');
+    } catch (e) {
+      parent.postMessage({ type: 'cnki-segmentit-error', error: e.message }, '*');
+    }
+  };
+  segScript.onerror = function () {
+    parent.postMessage({ type: 'cnki-segmentit-error', error: 'CDN script load failed' }, '*');
+  };
+  document.head.appendChild(segScript);
+
+  // SegmentIt 超时兜底：10 秒未加载完成则报错
+  setTimeout(function () {
+    if (!segmentitReady) {
+      parent.postMessage({ type: 'cnki-segmentit-error', error: 'CDN load timeout' }, '*');
+    }
+  }, 10000);
+
+  // --- OpenCC（繁体→简体转换） ---
+  var occScript = document.createElement('script');
+  occScript.src = 'https://cdn.jsdelivr.net/npm/opencc-js@1.4.2/dist/umd/full.js';
+  occScript.onload = function () {
+    try {
+      // from:'t' 为 OpenCC 标准繁体（涵盖台/港繁体），to:'cn' 为大陆简体
+      openccConverter = OpenCC.Converter({ from: 't', to: 'cn' });
+      openccReady = true;
+      parent.postMessage({ type: 'cnki-opencc-ready' }, '*');
+    } catch (e) {
+      parent.postMessage({ type: 'cnki-opencc-error', error: e.message }, '*');
+    }
+  };
+  occScript.onerror = function () {
+    parent.postMessage({ type: 'cnki-opencc-error', error: 'CDN script load failed' }, '*');
+  };
+  document.head.appendChild(occScript);
+
+  // OpenCC 超时兜底
+  setTimeout(function () {
+    if (!openccReady) {
+      parent.postMessage({ type: 'cnki-opencc-error', error: 'CDN load timeout' }, '*');
+    }
+  }, 10000);
+
+  // --- 消息处理 ---
+  window.addEventListener('message', function (e) {
+    // 分词请求
+    if (e.data && e.data.type === 'cnki-segment') {
+      if (!segmentitReady || !segmenter) return;
+      try {
+        var tokens = segmenter.doSegment(e.data.text);
+        var words = tokens.map(function (t) { return { w: t.w, p: t.p }; });
+        parent.postMessage({ type: 'cnki-segment-result', id: e.data.id, words: words }, '*');
+      } catch (err) {
+        parent.postMessage({ type: 'cnki-segment-result', id: e.data.id, words: [] }, '*');
+      }
+      return;
+    }
+    // 繁→简转换请求
+    if (e.data && e.data.type === 'cnki-t2s-convert') {
+      if (!openccReady || !openccConverter) return;
+      try {
+        var result = openccConverter(e.data.text);
+        parent.postMessage({ type: 'cnki-t2s-result', id: e.data.id, result: result }, '*');
+      } catch (err) {
+        parent.postMessage({ type: 'cnki-t2s-result', id: e.data.id, result: null }, '*');
+      }
+    }
+  });
+})();
+</script>
+</body>
+</html>

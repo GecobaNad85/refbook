@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
   "name": "CNKI 工具书划词查询",
-  "version": "1.0.0",
-  "description": "选中文本后查询CNKI工具书释义内容",
+  "version": "1.3.1",
+  "description": "选中文本或点击页面图标输入词语，查询CNKI工具书释义内容",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
     "https://t.cnki.net/*",
-    "https://gongjushu.cnki.net/*"
+    "https://gongjushu.cnki.net/*",
+    "https://bar.cnki.net/*",
+    "https://cdn.jsdelivr.net/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -27,11 +29,23 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_title": "CNKI 工具书划词查询",
+    "default_title": "CNKI 工具书划词查询（点击查看说明）",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["help.html", "sandbox.html", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "sandbox": {
+    "pages": ["sandbox.html"]
+  },
+  "content_security_policy": {
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"
   }
 }

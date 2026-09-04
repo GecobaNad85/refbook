@@ -451,7 +451,7 @@ Access-Control-Allow-Origin: https://kns.cnki.net  （不能用 *）
 ### 前端调用示例
 
 ```javascript
-function searchToolbook(keyword) {
+function searchRefbook(keyword) {
   const payload = {
     resource: "CROSSDB",
     product: "TOTAL",
@@ -559,7 +559,7 @@ has been blocked by CORS policy
 
 ```javascript
 // Node.js 示例
-app.post('/api/toolbook', async (req, res) => {
+app.post('/api/refbook', async (req, res) => {
   const result = await fetch('https://t.cnki.net/rbook-api/v1/criteria/query?uniplatform=NRBOOK', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

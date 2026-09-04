@@ -1,0 +1,96 @@
+/* 工具书查词 · Tauri 桌面版 —— 与浏览器扩展展示形式一致 */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px; line-height: 1.6; color: #333;
+  background: #fff;
+}
+
+/* ===== 弹窗（与扩展 .cnki-tb-popup 一致）===== */
+.tb-popup {
+  display: flex; flex-direction: column;
+  width: 100%; max-width: 90vw; height: 100vh; max-height: 80vh;
+  background: #fff; border: 1px solid #e8e8e8; border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+  overflow: hidden;
+}
+.tb-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid #f0f0f0; background: #f8f9ff;
+  border-radius: 10px 10px 0 0; flex-shrink: 0;
+}
+.tb-title { font-size: 13px; font-weight: 600; color: #2347ff; }
+.tb-count { font-size: 12px; color: #999; }
+.tb-close { background: none; border: none; font-size: 18px; color: #999; cursor: pointer; padding: 0 4px; line-height: 1; }
+.tb-close:hover { color: #333; }
+.tb-body { padding: 4px 0; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+.tb-body::-webkit-scrollbar { width: 5px; }
+.tb-body::-webkit-scrollbar-track { background: transparent; }
+.tb-body::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+
+.tb-result { padding: 12px 16px; }
+.tb-result-border { border-top: 1px solid #f0f0f0; }
+.tb-word { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 4px; }
+.tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
+.tb-fulltext-btn {
+  display: inline-block; margin-top: 6px; margin-bottom: 8px; padding: 4px 12px;
+  font-size: 12px; color: #fff; background: #2347ff;
+  border: none; border-radius: 4px; cursor: pointer;
+}
+.tb-fulltext-btn:hover { background: #1a36cc; }
+.tb-expand-toggle { color: #2347ff; cursor: pointer; font-size: 12px; margin-left: 4px; white-space: nowrap; user-select: none; }
+.tb-expand-toggle:hover { text-decoration: underline; }
+.tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
+.tb-book-link { color: #2347ff; text-decoration: none; cursor: pointer; }
+.tb-book-link:hover { text-decoration: underline; }
+.tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tb-tag { display: inline-block; font-size: 11px; color: #2347ff; background: #d0e3ff; padding: 2px 8px; border-radius: 3px; }
+
+.tb-footer {
+  display: block; text-align: center; padding: 10px 16px;
+  font-size: 13px; color: #2347ff; text-decoration: none;
+  border-top: 1px solid #f0f0f0; border-radius: 0 0 10px 10px; cursor: pointer;
+  flex-shrink: 0;
+}
+.tb-footer:hover { background: #f8f9ff; }
+.tb-empty-msg { text-align: center; padding: 24px 16px; color: #999; font-size: 14px; }
+.tb-error-msg { text-align: center; padding: 24px 16px; color: #e74c3c; font-size: 13px; }
+.tb-loading-msg { text-align: center; padding: 24px 16px; color: #666; font-size: 13px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.tb-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #d0e3ff; border-top-color: #2347ff; border-radius: 50%; animation: tb-spin .6s linear infinite; }
+@keyframes tb-spin { to { transform: rotate(360deg); } }
+
+/* ===== 主窗口（搜索面板，复用弹窗的卡片样式）===== */
+.main-view { height: 100vh; display: flex; flex-direction: column; background: #f7f8fa; }
+.main-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 18px; background: #fff; border-bottom: 1px solid #e8e8e8; flex-shrink: 0;
+}
+.main-brand { display: flex; align-items: baseline; gap: 10px; }
+.main-brand .logo { font-size: 22px; }
+.main-brand .title { font-weight: 600; font-size: 16px; color: #222; }
+.main-brand .subtitle { color: #888; font-size: 12px; }
+.status { width: 10px; height: 10px; border-radius: 50%; background: #999; }
+.status.ok { background: #2e9c5e; }
+.status.bad { background: #d9534f; }
+
+.main-container { flex: 1; overflow-y: auto; padding: 18px; }
+.main-search-box { display: flex; gap: 8px; margin-bottom: 14px; max-width: 820px; margin-left: auto; margin-right: auto; }
+.main-search-box input {
+  flex: 1; padding: 10px 14px; font-size: 15px;
+  border: 1px solid #e8e8e8; border-radius: 8px; outline: none; background: #fff;
+}
+.main-search-box input:focus { border-color: #2347ff; box-shadow: 0 0 0 2px #d0e3ff; }
+.main-search-box button {
+  padding: 10px 22px; font-size: 14px; cursor: pointer;
+  background: #2347ff; color: #fff; border: none; border-radius: 8px;
+}
+.main-search-box button:hover { background: #1a36cc; }
+
+.main-results { max-width: 820px; margin: 0 auto; }
+.main-results .tb-result { background: #fff; border: 1px solid #e8e8e8; border-radius: 10px; margin-bottom: 10px; }
+.main-results .tb-result-border { border-top: 1px solid #f0f0f0; }
+.main-loading, .main-error { max-width: 820px; margin: 0 auto; padding: 20px; text-align: center; color: #888; }
+.main-error { color: #e74c3c; }
+.main-empty { max-width: 820px; margin: 0 auto; padding: 24px; text-align: center; color: #999; }
+.main-foot { text-align: center; color: #888; font-size: 12px; padding: 16px; border-top: 1px solid #e8e8e8; flex-shrink: 0; }

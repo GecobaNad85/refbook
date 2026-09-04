@@ -1,5 +1,13 @@
+# OS / editor
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
 *~
+
+# Dependencies (all subprojects)
+node_modules/
+.npm-cache/
+
+# Build snapshots
+.alma-snapshots

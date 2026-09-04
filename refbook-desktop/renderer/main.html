@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>工具书查词 · 桌面版</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📖</span>
+      <span class="title">工具书查词</span>
+      <span class="subtitle">CNKI 工具书 · 划词查询桌面版</span>
+    </div>
+    <div class="status" id="status-dot" title="连接状态"></div>
+  </header>
+
+  <main class="container">
+    <section class="search-box">
+      <input id="word-input" type="text" placeholder="输入词目，例如：Meta分析、辨证论治、循证医学…" autocomplete="off" autofocus />
+      <button id="search-btn">查 词</button>
+    </section>
+
+    <section id="meta-bar" class="meta-bar" hidden>
+      <span id="total-label"></span>
+      <button id="detail-toggle" class="ghost" type="button">🔖 查看完整释义</button>
+    </section>
+
+    <section id="results" class="results"></section>
+    <section id="detail-panel" class="detail-panel" hidden></section>
+  </main>
+
+  <footer class="foot">
+    桌面划词：选中任意文字后按 <b>Ctrl+Shift+D</b> 弹窗查词。
+    完整释义正文可能需要机构内网或登录态。
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

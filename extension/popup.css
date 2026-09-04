@@ -1,12 +1,11 @@
 /*
-  CNKI 工具书划词查询 - 弹窗样式（后备）
-  主样式由 content.js 的 injectPopupStyles() 注入。
-  此处保留一份备份以便参考和直接查看。 */
+  CNKI 工具书划词查询 - 弹窗样式
+  由 manifest.json 作为 content_scripts.css 自动注入，无需 JS 动态注入。 */
 
 
-#cnki-toolbook-popup { all: initial; position: fixed; z-index: 2147483647; display: none; }
+#cnki-refbook-popup { all: initial; position: fixed; z-index: 2147483647; display: none; }
 
-#cnki-toolbook-popup .cnki-tb-popup {
+#cnki-refbook-popup .cnki-tb-popup {
   display: block;
   width: 380px;
   max-width: 90vw;
@@ -16,9 +15,13 @@
   border: 1px solid #e8e8e8;
   border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #333;
 }
 
-#cnki-toolbook-popup .cnki-tb-header {
+#cnki-refbook-popup .cnki-tb-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -28,46 +31,140 @@
   border-radius: 10px 10px 0 0;
 }
 
-#cnki-toolbook-popup .cnki-tb-title { font-size: 13px; font-weight: 600; color: #2347ff; }
+#cnki-refbook-popup .cnki-tb-title { font-size: 13px; font-weight: 600; color: #2347ff; }
 
-#cnki-toolbook-popup .cnki-tb-count { font-size: 12px; color: #999; }
+#cnki-refbook-popup .cnki-tb-count { font-size: 12px; color: #999; }
 
-#cnki-toolbook-popup .cnki-tb-body { padding: 4px 0; }
+#cnki-refbook-popup .cnki-tb-body { padding: 4px 0; }
 
-#cnki-toolbook-popup .cnki-tb-result { padding: 12px 16px; }
+#cnki-refbook-popup .cnki-tb-result { padding: 12px 16px; }
 
-#cnki-toolbook-popup .cnki-tb-result-border { border-top: 1px solid #f0f0f0; }
+#cnki-refbook-popup .cnki-tb-result-border { border-top: 1px solid #f0f0f0; }
 
-#cnki-toolbook-popup .cnki-tb-word { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 4px; }
+#cnki-refbook-popup .cnki-tb-word { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 4px; }
 
-#cnki-toolbook-popup .cnki-tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
+#cnki-refbook-popup .cnki-tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
 
-#cnki-toolbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
-#cnki-toolbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
+#cnki-refbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
+#cnki-refbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
 
-#cnki-toolbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
+#cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
 
-#cnki-toolbook-popup .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#cnki-refbook-popup .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-#cnki-toolbook-popup .cnki-tb-tag {
+#cnki-refbook-popup .cnki-tb-tag {
   display: inline-block; font-size: 11px; color: #2347ff; background: #d0e3ff;
   padding: 2px 8px; border-radius: 3px;
 }
 
-#cnki-toolbook-popup .cnki-tb-citation { font-size: 11px; color: #e67e22; }
-
-#cnki-toolbook-popup .cnki-tb-footer {
+#cnki-refbook-popup .cnki-tb-footer {
   display: block; text-align: center; padding: 10px 16px;
   font-size: 13px; color: #2347ff; text-decoration: none;
   border-top: 1px solid #f0f0f0; border-radius: 0 0 10px 10px; cursor: pointer;
 }
 
-#cnki-toolbook-popup .cnki-tb-footer:hover { background: #f8f9ff; }
+#cnki-refbook-popup .cnki-tb-footer:hover { background: #f8f9ff; }
 
-#cnki-toolbook-popup .cnki-tb-empty-msg { text-align: center; padding: 24px 16px; color: #999; font-size: 14px; }
+#cnki-refbook-popup .cnki-tb-empty-msg { text-align: center; padding: 24px 16px; color: #999; font-size: 14px; }
 
-#cnki-toolbook-popup .cnki-tb-error-msg { text-align: center; padding: 24px 16px; color: #e74c3c; font-size: 13px; }
+#cnki-refbook-popup .cnki-tb-error-msg { text-align: center; padding: 24px 16px; color: #e74c3c; font-size: 13px; }
 
-#cnki-toolbook-popup .cnki-tb-popup::-webkit-scrollbar { width: 5px; }
-#cnki-toolbook-popup .cnki-tb-popup::-webkit-scrollbar-track { background: transparent; }
-#cnki-toolbook-popup .cnki-tb-popup::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+#cnki-refbook-popup .cnki-tb-popup::-webkit-scrollbar { width: 5px; }
+#cnki-refbook-popup .cnki-tb-popup::-webkit-scrollbar-track { background: transparent; }
+#cnki-refbook-popup .cnki-tb-popup::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+
+#cnki-refbook-popup .cnki-tb-fulltext-btn {
+  display: inline-block; margin-top: 6px; padding: 4px 12px;
+  font-size: 12px; color: #fff; background: #2347ff;
+  border: none; border-radius: 4px; cursor: pointer;
+}
+#cnki-refbook-popup .cnki-tb-fulltext-btn:hover { background: #1a36cc; }
+#cnki-refbook-popup .cnki-tb-expand-toggle {
+  color: #2347ff; cursor: pointer; font-size: 12px; margin-left: 4px;
+  white-space: nowrap; user-select: none;
+}
+#cnki-refbook-popup .cnki-tb-expand-toggle:hover { text-decoration: underline; }
+
+/* 加载指示器 */
+.cnki-tb-loading {
+  position: fixed; z-index: 2147483646; background: #fff; border: 1px solid #e0e0e0;
+  border-radius: 8px; padding: 12px 20px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size: 13px; color: #666; display: flex; align-items: center; gap: 8px; pointer-events: none;
+}
+.cnki-tb-spinner {
+  display: inline-block; width: 14px; height: 14px;
+  border: 2px solid #d0e3ff; border-top-color: #2347ff; border-radius: 50%;
+  animation: cnki-spin .6s linear infinite;
+}
+
+/* 浮动图标入口（FAB），可拖动 */
+#cnki-refbook-fab {
+  position: fixed; bottom: 24px; right: 24px; z-index: 2147483646;
+  width: 48px; height: 48px; border-radius: 50%;
+  background: transparent; border: 1px solid rgba(35,71,255,0.22); box-shadow: 0 4px 14px rgba(35,71,255,0.35);
+  display: flex; align-items: center; justify-content: center;
+  cursor: grab; user-select: none; opacity: 0.9; box-sizing: content-box;
+  transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+  touch-action: none;
+}
+#cnki-refbook-fab:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(35,71,255,0.55); opacity: 1; }
+#cnki-refbook-fab:active { transform: scale(0.96); }
+#cnki-refbook-fab.cnki-tb-fab-dragging {
+  cursor: grabbing; opacity: 1; transform: scale(1.06);
+  box-shadow: 0 8px 24px rgba(35,71,255,0.6); transition: none;
+}
+#cnki-refbook-fab svg { width: 24px; height: 24px; fill: #fff; pointer-events: none; }
+#cnki-refbook-fab img { width: 34px; height: 34px; object-fit: contain; pointer-events: none; }
+
+/* 图标入口搜索面板 */
+#cnki-refbook-popup .cnki-tb-search-popup { display: flex; flex-direction: column; overflow: hidden; }
+#cnki-refbook-popup .cnki-tb-search-popup .cnki-tb-body { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+#cnki-refbook-popup .cnki-tb-search-popup .cnki-tb-body::-webkit-scrollbar { width: 5px; }
+#cnki-refbook-popup .cnki-tb-search-popup .cnki-tb-body::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+
+#cnki-refbook-popup .cnki-tb-search-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid #f0f0f0; background: #f8f9ff;
+  border-radius: 10px 10px 0 0;
+}
+#cnki-refbook-popup .cnki-tb-search-icon { flex: 0 0 auto; display: flex; }
+#cnki-refbook-popup .cnki-tb-search-icon svg { width: 18px; height: 18px; fill: #2347ff; }
+#cnki-refbook-popup .cnki-tb-search-input {
+  flex: 1 1 auto; min-width: 0; height: 30px; border: 1px solid #d8d8d8;
+  border-radius: 6px; padding: 0 10px; font-size: 13px; color: #333; outline: none;
+  background: #fff; box-sizing: border-box;
+}
+#cnki-refbook-popup .cnki-tb-search-input:focus { border-color: #2347ff; }
+#cnki-refbook-popup .cnki-tb-search-btn {
+  flex: 0 0 auto; height: 30px; padding: 0 14px; border: none; border-radius: 6px;
+  background: #2347ff; color: #fff; font-size: 13px; cursor: pointer;
+}
+#cnki-refbook-popup .cnki-tb-search-btn:hover { background: #1a36cc; }
+#cnki-refbook-popup .cnki-tb-search-close {
+  flex: 0 0 auto; width: 26px; height: 26px; border: none; background: transparent;
+  color: #999; font-size: 20px; line-height: 1; cursor: pointer; border-radius: 4px;
+}
+#cnki-refbook-popup .cnki-tb-search-close:hover { background: #e8eaff; color: #555; }
+#cnki-refbook-popup .cnki-tb-search-hint { text-align: center; padding: 24px 16px 4px; color: #888; font-size: 13px; }
+#cnki-refbook-popup .cnki-tb-search-subhint { text-align: center; padding: 0 16px 24px; color: #b0b0b0; font-size: 12px; }
+#cnki-refbook-popup .cnki-tb-search-status { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 24px 16px; color: #666; font-size: 13px; }
+
+/* 分词查询标签栏 */
+#cnki-refbook-popup .cnki-tb-tabs {
+  display: flex; overflow-x: auto; border-bottom: 1px solid #f0f0f0; background: #fafafa;
+  -webkit-overflow-scrolling: touch; scrollbar-width: thin;
+}
+#cnki-refbook-popup .cnki-tb-tabs::-webkit-scrollbar { height: 3px; }
+#cnki-refbook-popup .cnki-tb-tabs::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 2px; }
+#cnki-refbook-popup .cnki-tb-tab {
+  flex: 0 0 auto; padding: 8px 14px; font-size: 13px; color: #777; cursor: pointer;
+  white-space: nowrap; border-bottom: 2px solid transparent; user-select: none;
+  transition: color .15s, border-color .15s;
+}
+#cnki-refbook-popup .cnki-tb-tab:hover { color: #2347ff; }
+#cnki-refbook-popup .cnki-tb-tab.active {
+  color: #2347ff; font-weight: 600; border-bottom-color: #2347ff; background: #fff;
+}
+#cnki-refbook-popup .cnki-tb-tab-empty { font-size: 11px; color: #ccc; margin-left: 3px; }
+#cnki-refbook-popup .cnki-tb-tab-count { font-size: 11px; color: #aaa; margin-left: 3px; }
