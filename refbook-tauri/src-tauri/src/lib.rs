@@ -272,10 +272,11 @@ fn show_float_if_enabled(app: &AppHandle) {
     }
 }
 
-/// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / 退出
+/// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / CNKI登录 / 退出
 fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let lookup = MenuItem::with_id(app, "lookup", "划词查询", true, None::<&str>)?;
+    let login = MenuItem::with_id(app, "login", "CNKI 登录…", true, None::<&str>)?;
     let float_toggle =
         CheckMenuItem::with_id(app, "toggle-float", "显示悬浮图标", true, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -283,6 +284,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&show)
         .item(&lookup)
         .separator()
+        .item(&login)
         .item(&float_toggle)
         .separator()
         .item(&quit)
@@ -299,6 +301,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main(app),
             "lookup" => trigger_selection_lookup(app),
+            "login" => open_cnki_login(app.clone()),
             "toggle-float" => {
                 // 从我们维护的 float_enabled 推导新状态（而非 is_checked()——
                 // 原生菜单点击时部分平台会自动翻转 check，再读 is_checked 会二次翻转导致状态不变）
@@ -489,6 +492,138 @@ fn focus_main(app: tauri::AppHandle) {
     show_main(&app);
 }
 
+/// CNKI 登录/鉴权窗口的注入脚本：监听 Rust 下发的查询请求，在 gongjushu.cnki.net
+/// 页面上下文内带 cookie fetch t.cnki.net entry/detail API（等价于扩展 content.js 的
+/// callEntryApiWithCookie）。结果写入 window.__cnkiResult，由 Rust 侧 eval 读取
+/// （External URL 页面不注入 __TAURI__ 全局，不能用 emit 回传）。
+const CNKI_AUTH_INIT_SCRIPT: &str = r#"
+(function () {
+  window.__cnkiResult = null; // { reqId, ok, content, error }
+  window.__cnkiDetail = async function (req) {
+    var SCOPES = ['content', 'preview', 'download'];
+    async function tryScope(scope) {
+      var body = {
+        filename: req.fn_, tablename: req.tablename || 'CRFD2025',
+        product: req.product || 'CRFD', platform: 'NRBOOK', type: 'REFBOOK',
+        scope: scope, cflag: 'overlay', dflag: '词条', language: 'CHS',
+        pages: '', sid: '', idenid: ''
+      };
+      var r = await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json;charset=utf-8', language: 'CHS',
+                   Origin: 'https://gongjushu.cnki.net', Referer: 'https://gongjushu.cnki.net/' },
+        credentials: 'include',
+        body: JSON.stringify(body)
+      });
+      var j = await r.json();
+      if (j.code !== 0) throw new Error(j.message || ('code ' + j.code));
+      var c = (j.data && j.data.data && j.data.data[0] && j.data.data[0].content) || '';
+      c = c.replace(/<[^>]*>/g, '').trim();
+      if (!c) throw new Error('条目内容为空');
+      return c;
+    }
+    try {
+      var content = await Promise.any(SCOPES.map(tryScope));
+      return { ok: true, content: content };
+    } catch (e) {
+      var msg = (e && e.errors && e.errors[0] && e.errors[0].message) || (e && e.message) || '获取失败';
+      if (/未登录|登录|403|验证参数/.test(msg)) msg = '未登录或登录已过期，请在托盘菜单点击\"CNKI 登录…\"重新登录';
+      return { ok: false, content: '', error: msg };
+    }
+  };
+})();
+"#;
+
+/// 获取（或创建）CNKI 鉴权 webview：加载 gongjushu.cnki.net，带 cookie 罐，
+/// 注入 __cnkiDetail 用于带 cookie 调用 entry/detail API
+fn get_or_create_cnki_auth(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("cnki-auth") {
+        return Some(w);
+    }
+    let url: tauri::Url = "https://gongjushu.cnki.net/".parse().ok()?;
+    let w = WebviewWindowBuilder::new(app, "cnki-auth", WebviewUrl::External(url))
+        .title("CNKI 登录 · 工具书查词")
+        .inner_size(1024.0, 720.0)
+        .initialization_script(CNKI_AUTH_INIT_SCRIPT)
+        .build()
+        .ok()?;
+    Some(w)
+}
+
+/// 打开 CNKI 登录窗口（用户在此登录后，cookie 持久化到 webview cookie 罐，
+/// 之后"查看全文"经该窗口上下文带 cookie 调用 API）
+#[tauri::command]
+fn open_cnki_login(app: tauri::AppHandle) {
+    if let Some(w) = get_or_create_cnki_auth(&app) {
+        let _ = w.show();
+        let _ = w.set_focus();
+        // 已存在时导航回首页，方便重新登录
+        let _ = w.eval("window.location.href = 'https://gongjushu.cnki.net/';");
+    }
+}
+
+/// 带 cookie 查询条目全文：在 cnki-auth webview 内执行 __cnkiDetail，用 eval_with_callback
+/// 读取 window.__cnkiResult（External URL 页面无 __TAURI__ 全局，不能用 emit）。
+/// 前端"查看全文"调用此命令替代裸 reqwest 的 cnki_detail。
+#[tauri::command]
+async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String, product: String) -> cnki::DetailResponse {
+    let w = match app.get_webview_window("cnki-auth") {
+        Some(w) => w,
+        None => return cnki::DetailResponse {
+            ok: false, content: String::new(),
+            error: "未登录 CNKI，请先在托盘菜单点击\"CNKI 登录…\"".into(),
+        },
+    };
+    // 启动查询：调用注入的 __cnkiDetail，结果写入 window.__cnkiResult
+    let js = format!(
+        "(async () => {{ window.__cnkiResult=null; try {{ var r = await window.__cnkiDetail({{fn_:{fn_},tablename:{tn},product:{pd}}}); window.__cnkiResult=r; }} catch(e) {{ window.__cnkiResult={{ok:false,content:'',error:String(e)}}; }} }})();",
+        fn_ = serde_json::to_string(&fn_).unwrap_or_else(|_| "\"\"".into()),
+        tn = serde_json::to_string(&tablename).unwrap_or_else(|_| "\"\"".into()),
+        pd = serde_json::to_string(&product).unwrap_or_else(|_| "\"\"".into()),
+    );
+    if let Err(e) = w.eval(&js) {
+        return cnki::DetailResponse {
+            ok: false, content: String::new(),
+            error: format!("调用鉴权窗口失败: {e}"),
+        };
+    }
+    // 轮询读取 window.__cnkiResult：eval_with_callback 返回 JSON 字符串
+    use tokio::sync::oneshot;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if std::time::Instant::now() > deadline {
+            return cnki::DetailResponse {
+                ok: false, content: String::new(),
+                error: "查询超时，若未登录请在托盘菜单点击\"CNKI 登录…\"".into(),
+            };
+        }
+        let (tx, rx) = oneshot::channel::<String>();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let probe = "JSON.stringify(window.__cnkiResult)".to_string();
+        if w.eval_with_callback(probe, move |s: String| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(s);
+            }
+        }).is_err() {
+            continue;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(800), rx).await {
+            Ok(Ok(s)) => {
+                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) if !v.is_null() => v,
+                    _ => continue, // __cnkiResult 仍为 null，继续轮询
+                };
+                let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                return cnki::DetailResponse { ok, content, error };
+            }
+            _ => continue,
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -545,6 +680,8 @@ pub fn run() {
             popup_close,
             popup_open_external,
             open_entry_url,
+            open_cnki_login,
+            cnki_detail_auth,
             focus_main,
         ])
         .run(tauri::generate_context!())

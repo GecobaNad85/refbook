@@ -212,7 +212,8 @@ function renderResultItem(item, idx, tab) {
         abstractHtml = esc(displayText);
       }
     } else {
-      abstractHtml = '<span style="color:#999;font-size:12px;">获取释文失败，可尝试点击下方按钮</span>';
+      const err = tab.fetchError ? esc(tab.fetchError) : '获取释文失败';
+      abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" data-act="login">点此登录 CNKI</a> 后重试</span>`;
       mayHaveBtn = true;
     }
   }
@@ -313,6 +314,8 @@ function initMain() {
     if (e.target.classList.contains('tb-fulltext-btn')) { onFullText(); return; }
     const toggle = e.target.closest('.tb-expand-toggle');
     if (toggle) { onExpand(toggle); return; }
+    const loginLink = e.target.closest('[data-act="login"]');
+    if (loginLink) { invoke('open_cnki_login'); return; }
     const bookLink = e.target.closest('.tb-book-link');
     if (bookLink && bookLink.dataset.url) { invoke('open_entry_url', { url: bookLink.dataset.url }); return; }
   };
@@ -335,7 +338,7 @@ function initMain() {
     const data = j.results || [];
     if (data.length > 0) {
       // 整词命中：单标签，不显示标签头
-      tabs = [{ keyword, items: data, fullText: '', expanded: false }];
+      tabs = [{ keyword, items: data, fullText: '', expanded: false, fetchError: '' }];
       activeIndex = 0;
       currentKeyword = keyword;
       render();
@@ -366,8 +369,8 @@ function initMain() {
 
     // 构建标签：[原词(空)] + 各命中分词
     tabs = [
-      { keyword, items: [], fullText: '', expanded: false },
-      ...selected.map((r) => ({ keyword: r.seg.text, items: r.results, fullText: '', expanded: false })),
+      { keyword, items: [], fullText: '', expanded: false, fetchError: '' },
+      ...selected.map((r) => ({ keyword: r.seg.text, items: r.results, fullText: '', expanded: false, fetchError: '' })),
     ];
     activeIndex = 1; // 第一个有结果的分词标签
     currentKeyword = keyword;
@@ -408,9 +411,17 @@ function initMain() {
   }
   async function fetchFullText(tab, item, gen) {
     try {
-      const d = await invoke('cnki_detail', { fn_: item.fn, tablename: item.tablename, product: item.product });
+      // 优先走带 cookie 的鉴权路径（需 CNKI 登录）；失败回退裸 API
+      let d = await invoke('cnki_detail_auth', { fn_: item.fn, tablename: item.tablename, product: item.product });
+      if (!d.ok) {
+        // 鉴权失败（未登录/过期）→ 回退裸 reqwest，多半也失败但给个机会
+        try {
+          d = await invoke('cnki_detail', { fn_: item.fn, tablename: item.tablename, product: item.product });
+        } catch (_) {}
+      }
       if (gen !== generation) return;
       tab.fullText = d.ok ? d.content : '';
+      tab.fetchError = d.ok ? '' : (d.error || '');
       render();
     } catch (e) { /* 静默失败，保留按钮 */ }
   }
