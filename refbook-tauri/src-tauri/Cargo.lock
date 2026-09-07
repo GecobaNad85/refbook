@@ -3195,6 +3195,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "refbook-tauri"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "reqwest 0.12.28",
+ "scraper",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-global-shortcut",
+ "tauri-plugin-opener",
+ "tokio",
+ "x11-clipboard",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4063,6 +4080,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image",
  "jni",
  "libc",
  "log",
@@ -4635,23 +4653,6 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
-
-[[package]]
-name = "refbook-tauri"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "reqwest 0.12.28",
- "scraper",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-global-shortcut",
- "tauri-plugin-opener",
- "tokio",
- "x11-clipboard",
-]
 
 [[package]]
 name = "tower"

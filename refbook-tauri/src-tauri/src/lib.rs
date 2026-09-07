@@ -2,7 +2,12 @@
 mod cnki;
 
 use std::sync::Mutex;
-use tauri::{Emitter, Manager, WebviewWindow};
+use tauri::menu::{MenuBuilder, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
+};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Code, Modifiers, Shortcut, ShortcutState};
 
 struct AppState {
@@ -124,6 +129,86 @@ fn set_focus_delayed(win: &WebviewWindow) {
     });
 }
 
+/// 显示并聚焦主窗口（托盘 / 悬浮图标 / IPC 共用）
+fn show_main(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+}
+
+/// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 退出
+fn create_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let lookup = MenuItem::with_id(app, "lookup", "划词查询", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = MenuBuilder::new(app)
+        .item(&show)
+        .item(&lookup)
+        .separator()
+        .item(&quit)
+        .build()?;
+
+    let builder = TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .tooltip("工具书查词 · CNKI")
+        // macOS 惯例：左键直接弹出菜单；Windows/Linux 左键视为唤起主窗口
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .icon(tauri::include_image!("icons/32x32.png"));
+
+    builder
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main(app),
+            "lookup" => {
+                let state = app.state::<AppState>();
+                trigger_selection_lookup(app, state.inner());
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            #[cfg(not(target_os = "macos"))]
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// 创建桌面悬浮图标：透明置顶小窗，可拖拽，点击唤起主窗口
+fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
+    let float = WebviewWindowBuilder::new(app, "float", WebviewUrl::App("float.html".into()))
+        .title("工具书查词 · 悬浮图标")
+        .inner_size(56.0, 56.0)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .visible(false)
+        .build()?;
+
+    // 初始定位：主屏幕右下角，留出边距
+    if let Ok(monitor) = float.primary_monitor() {
+        if let Some(monitor) = monitor {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            let x = size.width as i32 - (56.0 * scale + 32.0 * scale).round() as i32;
+            let y = size.height as i32 - (56.0 * scale + 32.0 * scale).round() as i32;
+            let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+        }
+    }
+    let _ = float.show();
+    Ok(())
+}
+
 #[tauri::command]
 fn popup_close(window: WebviewWindow) {
     if window.label() == "popup" {
@@ -139,10 +224,7 @@ fn popup_open_external(app: tauri::AppHandle, url: String) {
 
 #[tauri::command]
 fn focus_main(app: tauri::AppHandle) {
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
+    show_main(&app);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -161,6 +243,21 @@ pub fn run() {
                     trigger_selection_lookup(&app_handle, state.inner());
                 }
             })?;
+
+            // 系统托盘 + 桌面悬浮图标
+            create_tray(app.handle())?;
+            create_floating_icon(app.handle())?;
+
+            // 主窗口"关闭"→ 隐藏到托盘（应用常驻，可经托盘/悬浮图标/快捷键唤起）
+            if let Some(main) = app.get_webview_window("main") {
+                let win = main.clone();
+                main.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

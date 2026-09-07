@@ -66,8 +66,8 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 18px; background: #fff; border-bottom: 1px solid #e8e8e8; flex-shrink: 0;
 }
-.main-brand { display: flex; align-items: baseline; gap: 10px; }
-.main-brand .logo { font-size: 22px; }
+.main-brand { display: flex; align-items: center; gap: 10px; }
+.main-brand .logo { width: 26px; height: 26px; display: block; }
 .main-brand .title { font-weight: 600; font-size: 16px; color: #222; }
 .main-brand .subtitle { color: #888; font-size: 12px; }
 .status { width: 10px; height: 10px; border-radius: 50%; background: #999; }
