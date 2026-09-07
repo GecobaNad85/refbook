@@ -2,7 +2,7 @@
 mod cnki;
 
 use std::sync::Mutex;
-use tauri::menu::{MenuBuilder, MenuItem};
+use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow,
@@ -12,6 +12,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Code, Modifiers, Shortcut,
 
 struct AppState {
     popup: Mutex<Option<WebviewWindow>>,
+    float: Mutex<Option<WebviewWindow>>,
 }
 
 #[tauri::command]
@@ -29,12 +30,19 @@ async fn cnki_ping() -> bool {
     cnki::ping().await
 }
 
-/// 读取系统选中文本：Linux 读 X11 PRIMARY 选区，其他平台读剪贴板
+/// 读取系统选中文本：Linux 读 X11/Wayland PRIMARY 选区，其他平台读剪贴板
 fn get_selection_text() -> String {
     #[cfg(target_os = "linux")]
     {
         // X11 PRIMARY selection：选中文字即存入，无需复制
         if let Some(text) = read_x11_primary() {
+            let t = text.trim().to_string();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+        // Wayland 会话下 X11 协议读不到原生应用的 PRIMARY 选区，改用 wl-paste --primary
+        if let Some(text) = read_wayland_primary() {
             let t = text.trim().to_string();
             if !t.is_empty() {
                 return t;
@@ -57,13 +65,31 @@ fn get_selection_text() -> String {
 fn read_x11_primary() -> Option<String> {
     let clipboard = x11_clipboard::Clipboard::new().ok()?;
     let atoms = &clipboard.getter.atoms;
-    let bytes = clipboard.load_wait(
-        atoms.primary,
-        atoms.utf8_string,
-        atoms.property,
-    ).ok()?;
+    // load 带超时（load_wait 会无限阻塞快捷键回调），超时即跳过走 Wayland 回退
+    let bytes = clipboard
+        .load(
+            atoms.primary,
+            atoms.utf8_string,
+            atoms.property,
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .ok()?;
     let s = String::from_utf8_lossy(&bytes);
     let s = s.trim_end_matches('\0').to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Wayland PRIMARY 选区读取：依赖 wl-clipboard 提供的 wl-paste 命令行工具
+#[cfg(target_os = "linux")]
+fn read_wayland_primary() -> Option<String> {
+    let out = std::process::Command::new("wl-paste")
+        .arg("--primary")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -137,14 +163,18 @@ fn show_main(app: &AppHandle) {
     }
 }
 
-/// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 退出
+/// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / 退出
 fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let lookup = MenuItem::with_id(app, "lookup", "划词查询", true, None::<&str>)?;
+    let float_toggle =
+        CheckMenuItem::with_id(app, "toggle-float", "显示悬浮图标", true, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
         .item(&show)
         .item(&lookup)
+        .separator()
+        .item(&float_toggle)
         .separator()
         .item(&quit)
         .build()?;
@@ -157,11 +187,24 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .icon(tauri::include_image!("icons/32x32.png"));
 
     builder
-        .on_menu_event(|app, event| match event.id().as_ref() {
+        .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main(app),
             "lookup" => {
                 let state = app.state::<AppState>();
                 trigger_selection_lookup(app, state.inner());
+            }
+            "toggle-float" => {
+                let checked = float_toggle.is_checked().unwrap_or(true);
+                let _ = float_toggle.set_checked(!checked);
+                let state = app.state::<AppState>();
+                let float = state.float.lock().unwrap().clone();
+                if let Some(float) = float {
+                    if checked {
+                        let _ = float.hide();
+                    } else {
+                        let _ = float.show();
+                    }
+                }
             }
             "quit" => app.exit(0),
             _ => {}
@@ -199,6 +242,9 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
         float_builder = float_builder.transparent(true);
     }
     let float = float_builder.build()?;
+    // 保存句柄，供托盘菜单开关悬浮图标使用
+    let state = app.state::<AppState>();
+    *state.float.lock().unwrap() = Some(float.clone());
 
     // macOS：窗口背景设为深色，让悬浮图标呈现为深色小方块
     #[cfg(target_os = "macos")]
@@ -243,7 +289,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(AppState { popup: Mutex::new(None) })
+        .manage(AppState {
+            popup: Mutex::new(None),
+            float: Mutex::new(None),
+        })
         .setup(|app| {
             // 全局快捷键 Ctrl+Alt+D（避免与浏览器 Ctrl+Shift+D 书签管理冲突）
             let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyD);
@@ -261,6 +310,11 @@ pub fn run() {
 
             // 主窗口"关闭"→ 隐藏到托盘（应用常驻，可经托盘/悬浮图标/快捷键唤起）
             if let Some(main) = app.get_webview_window("main") {
+                // 任务栏窗口图标：运行时显式设置（Linux/Windows 生效，macOS 用 .app 包内图标）
+                #[cfg(not(target_os = "macos"))]
+                if let Some(icon) = app.default_window_icon() {
+                    let _ = main.set_icon(icon.clone());
+                }
                 let win = main.clone();
                 main.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {

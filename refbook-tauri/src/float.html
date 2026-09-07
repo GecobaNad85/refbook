@@ -23,6 +23,7 @@
         cursor: pointer;
         user-select: none;
         -webkit-user-select: none;
+        touch-action: none;
         transition: transform 0.15s ease, background 0.15s ease;
       }
       #floating:hover {
@@ -40,28 +41,46 @@
     </style>
   </head>
   <body>
-    <div id="floating" data-tauri-drag-region>
+    <div id="floating">
       <img src="/assets/crfd.svg" alt="工具书查词" draggable="false" />
     </div>
     <script>
-      // 悬浮图标入口：单击唤起主窗口；按住可拖拽移动
+      // 悬浮图标入口：单击唤起主窗口（查词界面）；按住拖动可移动
+      // 注意：不能用 data-tauri-drag-region —— 它会在 mousedown 即抢占原生拖拽，
+      // 导致 GTK 下 click 事件不可靠；这里改用手动指针事件 + start_dragging
       const { invoke } = window.__TAURI__.core;
       const el = document.getElementById('floating');
-      let down = { x: 0, y: 0 };
+      let downX = 0, downY = 0;
       let moved = false;
+      let dragging = false;
 
       el.addEventListener('pointerdown', (e) => {
-        down = { x: e.screenX, y: e.screenY };
+        if (e.button !== 0) return;
+        downX = e.screenX;
+        downY = e.screenY;
         moved = false;
+        dragging = false;
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch (_) {}
       });
+
       el.addEventListener('pointermove', (e) => {
-        if (Math.abs(e.screenX - down.x) > 3 || Math.abs(e.screenY - down.y) > 3) {
-          moved = true;
+        if (e.buttons !== 1) return;
+        const dx = e.screenX - downX;
+        const dy = e.screenY - downY;
+        if (!dragging && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
+          dragging = true;
+          invoke('plugin:window|start_dragging').catch(() => {});
         }
+        if (dragging) moved = true;
       });
-      el.addEventListener('click', (e) => {
-        if (e.button !== 0 || moved) return;
-        invoke('focus_main');
+
+      el.addEventListener('pointerup', (e) => {
+        if (e.button !== 0 || dragging) return;
+        if (!moved) {
+          invoke('focus_main');
+        }
       });
     </script>
   </body>
