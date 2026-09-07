@@ -45,6 +45,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build
+        uses: tauri-apps/rust-cache@v0
+        with:
+          workspaces: refbook-tauri/src-tauri -> target
+
       - name: Add macOS universal targets
         if: matrix.os == 'macos-latest'
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
@@ -60,7 +65,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: refbook-tauri
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build Tauri App
         id: tauri-action
