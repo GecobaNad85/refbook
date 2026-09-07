@@ -436,10 +436,11 @@ function initMain() {
     render();
     try {
       // 优先走带 cookie 的鉴权路径（需 CNKI 登录）；失败回退裸 API
-      let d = await invoke('cnki_detail_auth', { fn_: item.fn, tablename: item.tablename, product: item.product });
+      // 注意：Tauri 将 Rust 参数名 fn_ 重命名为 fn，invoke 须传 fn
+      let d = await invoke('cnki_detail_auth', { fn: item.fn, tablename: item.tablename, product: item.product });
       if (!d.ok) {
         try {
-          d = await invoke('cnki_detail', { fn_: item.fn, tablename: item.tablename, product: item.product });
+          d = await invoke('cnki_detail', { fn: item.fn, tablename: item.tablename, product: item.product });
         } catch (_) {}
       }
       if (gen !== generation) return;
