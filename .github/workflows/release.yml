@@ -81,7 +81,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
-        uses: tauri-apps/rust-cache@v0
+        uses: swatinem/rust-cache@v2
         with:
           workspaces: refbook-tauri/src-tauri -> target
 
