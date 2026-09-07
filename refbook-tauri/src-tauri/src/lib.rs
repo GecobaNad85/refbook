@@ -183,17 +183,28 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
 
 /// 创建桌面悬浮图标：透明置顶小窗，可拖拽，点击唤起主窗口
 fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
-    let float = WebviewWindowBuilder::new(app, "float", WebviewUrl::App("float.html".into()))
+    #[allow(unused_mut)] // macOS 分支不会在此变更，仅在其他平台设置透明
+    let mut float_builder = WebviewWindowBuilder::new(app, "float", WebviewUrl::App("float.html".into()))
         .title("工具书查词 · 悬浮图标")
         .inner_size(56.0, 56.0)
         .resizable(false)
         .decorations(false)
-        .transparent(true)
         .always_on_top(true)
         .skip_taskbar(true)
         .shadow(false)
-        .visible(false)
-        .build()?;
+        .visible(false);
+    // macOS 默认不支持透明窗口（需 macos-private-api 特性），改用深色窗口背景
+    #[cfg(not(target_os = "macos"))]
+    {
+        float_builder = float_builder.transparent(true);
+    }
+    let float = float_builder.build()?;
+
+    // macOS：窗口背景设为深色，让悬浮图标呈现为深色小方块
+    #[cfg(target_os = "macos")]
+    {
+        let _ = float.set_background_color(Some(tauri::webview::Color(15, 40, 66, 255)));
+    }
 
     // 初始定位：主屏幕右下角，留出边距
     if let Ok(monitor) = float.primary_monitor() {

@@ -72,7 +72,7 @@ jobs:
           args: ${{ matrix.args }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: refbook-${{ matrix.label }}
           if-no-files-found: warn
