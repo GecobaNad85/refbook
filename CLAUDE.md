@@ -65,7 +65,7 @@ No build system. Load `extension/` as an unpacked extension in `chrome://extensi
 `refbook-tauri/` 是独立的 Tauri v2 原型（Rust，无前端构建步骤，前端在 `src/`）。与扩展共用 API 逻辑（`src-tauri/src/cnki.rs`）。
 
 - **划词选区读取**（`get_selection_text`，Linux）：X11 PRIMARY（`x11-clipboard::load`，200ms 超时，避免 `load_wait` 阻塞）→ Wayland PRIMARY（`wl-paste --primary` 子进程）→ 剪贴板（arboard，需要用户按过 Ctrl+C）。**Wayland 下 PRIMARY 必须安装 `wl-clipboard`**，否则选区读不到（弹窗会提示"未检测到选中文本"）。X11 PRIMARY 与 Wayland 选区经 XWayland 互不可达，因此两者都要尝试。
-- **托盘**（`create_tray`）：左键唤起主窗口（非 macOS），菜单 = 显示主窗口 / 划词查询 / **显示悬浮图标**（`CheckMenuItem` 开关，切换 float 窗口 show/hide）/ 退出。Ctrl+Alt+D 全局快捷键触发划词查询。
-- **悬浮图标**（`create_floating_icon` + `src/float.html`）：56×56 透明置顶小窗。**不能用 `data-tauri-drag-region`**（GTK 下 mousedown 即抢占原生拖拽，click 不可靠）；改用 pointer 事件：pointermove 位移 >5px → `invoke('plugin:window|start_dragging')`，pointerup 无位移 → `invoke('focus_main')`。
+- **托盘**（`create_tray`）：左键唤起主窗口（非 macOS），菜单 = 显示主窗口 / 划词查询 / **显示悬浮图标**（`CheckMenuItem` 开关，控制悬浮图标是否允许显示）/ 退出。Ctrl+Alt+D 全局快捷键触发划词查询。
+- **悬浮图标**（`create_floating_icon` + `src/float.html`）：56×56 透明置顶小窗。**与主窗口联动**：主窗口可见时隐藏，主窗口关闭（隐藏到托盘）后才显示（`sync_float_with_main`，同时受托盘开关约束）。**不能用 `data-tauri-drag-region`**（GTK 下 mousedown 即抢占原生拖拽，click 不可靠）；改用 pointer 事件：pointermove 位移 >5px → `invoke('plugin:window|start_dragging')`，pointerup 无位移 → `invoke('focus_main')`。初始定位在主屏右下角。
 - **主窗口图标**：`tauri.conf.json` 的 `bundle.icon` 已全部由 `icons/crfd.svg` 生成（png/icns/ico）。Linux 默认窗口图标取 icon 列表第一个 `.png`（已调整为 128x128）；setup 中再用 `main.set_icon(app.default_window_icon())` 显式设置（非 macOS）。deb 程序列表图标由 bundler 按实际尺寸拷进 hicolor，新构建即生效。
 - 主窗口"关闭"→ 隐藏到托盘；窗口图标、托盘、悬浮图标在同一 `AppState` 管理中。

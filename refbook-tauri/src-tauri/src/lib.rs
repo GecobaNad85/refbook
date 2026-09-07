@@ -13,6 +13,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Code, Modifiers, Shortcut,
 struct AppState {
     popup: Mutex<Option<WebviewWindow>>,
     float: Mutex<Option<WebviewWindow>>,
+    /// 托盘"显示悬浮图标"开关：false 时即使主窗口关闭也不显示悬浮图标
+    float_enabled: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -161,6 +163,26 @@ fn show_main(app: &AppHandle) {
         let _ = main.show();
         let _ = main.set_focus();
     }
+    // 主窗口可见时隐藏悬浮图标入口
+    sync_float_with_main(app);
+}
+
+/// 悬浮图标与主窗口联动：主窗口可见 → 隐藏悬浮图标；主窗口关闭（隐藏）后 → 显示
+fn sync_float_with_main(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let float = state.float.lock().unwrap().clone();
+    let enabled = *state.float_enabled.lock().unwrap();
+    let main_visible = app
+        .get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    if let Some(float) = float {
+        if main_visible || !enabled {
+            let _ = float.hide();
+        } else {
+            let _ = float.show();
+        }
+    }
 }
 
 /// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / 退出
@@ -197,14 +219,8 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                 let checked = float_toggle.is_checked().unwrap_or(true);
                 let _ = float_toggle.set_checked(!checked);
                 let state = app.state::<AppState>();
-                let float = state.float.lock().unwrap().clone();
-                if let Some(float) = float {
-                    if checked {
-                        let _ = float.hide();
-                    } else {
-                        let _ = float.show();
-                    }
-                }
+                *state.float_enabled.lock().unwrap() = !checked;
+                sync_float_with_main(app);
             }
             "quit" => app.exit(0),
             _ => {}
@@ -262,7 +278,7 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
             let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
         }
     }
-    let _ = float.show();
+    // 初始不显示：主窗口可见时隐藏悬浮图标，主窗口关闭（隐藏到托盘）后才显示
     Ok(())
 }
 
@@ -292,6 +308,7 @@ pub fn run() {
         .manage(AppState {
             popup: Mutex::new(None),
             float: Mutex::new(None),
+            float_enabled: Mutex::new(true),
         })
         .setup(|app| {
             // 全局快捷键 Ctrl+Alt+D（避免与浏览器 Ctrl+Shift+D 书签管理冲突）
@@ -320,6 +337,9 @@ pub fn run() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = win.hide();
+                        // 主窗口已隐藏到托盘 → 显示悬浮图标入口
+                        let app = win.app_handle();
+                        sync_float_with_main(app);
                     }
                 });
             }
