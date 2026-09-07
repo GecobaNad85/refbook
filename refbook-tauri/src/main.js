@@ -410,20 +410,27 @@ function initMain() {
     fetchFullText(tab, tab.items[0], generation);
   }
   async function fetchFullText(tab, item, gen) {
+    tab.expanded = true;
+    tab.fullText = '';
+    tab.fetchError = '加载中…';
+    render();
     try {
       // 优先走带 cookie 的鉴权路径（需 CNKI 登录）；失败回退裸 API
       let d = await invoke('cnki_detail_auth', { fn_: item.fn, tablename: item.tablename, product: item.product });
       if (!d.ok) {
-        // 鉴权失败（未登录/过期）→ 回退裸 reqwest，多半也失败但给个机会
         try {
           d = await invoke('cnki_detail', { fn_: item.fn, tablename: item.tablename, product: item.product });
         } catch (_) {}
       }
       if (gen !== generation) return;
       tab.fullText = d.ok ? d.content : '';
-      tab.fetchError = d.ok ? '' : (d.error || '');
+      tab.fetchError = d.ok ? '' : (d.error || '获取释文失败');
       render();
-    } catch (e) { /* 静默失败，保留按钮 */ }
+    } catch (e) {
+      if (gen !== generation) return;
+      tab.fetchError = '请求出错：' + String(e);
+      render();
+    }
   }
   function onExpand(toggle) {
     const raw = decodeURIComponent(toggle.dataset.raw || '');

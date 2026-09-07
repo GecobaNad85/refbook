@@ -562,8 +562,9 @@ fn open_cnki_login(app: tauri::AppHandle) {
     }
 }
 
-/// 带 cookie 查询条目全文：在 cnki-auth webview 内执行 __cnkiDetail，用 eval_with_callback
-/// 读取 window.__cnkiResult（External URL 页面无 __TAURI__ 全局，不能用 emit）。
+/// 带 cookie 查询条目全文：在 cnki-auth webview 内执行 fetch（带 cookie），结果通过
+/// document.title 回传（External URL 页面无 __TAURI__ 全局，eval_with_callback 在
+/// 跨域页面上回调不可靠；title() 可同步读取 JS 设置的 document.title）。
 /// 前端"查看全文"调用此命令替代裸 reqwest 的 cnki_detail。
 #[tauri::command]
 async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String, product: String) -> cnki::DetailResponse {
@@ -574,12 +575,43 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
             error: "未登录 CNKI，请先在托盘菜单点击\"CNKI 登录…\"".into(),
         },
     };
-    // 启动查询：调用注入的 __cnkiDetail，结果写入 window.__cnkiResult
+    // 用唯一标记避免读到旧 title。fetch 逻辑内联，不依赖 init script 注入时机。
+    // title 容量有限（约数 KB），结果过长会被引擎截断 → content 末尾可能不完整，
+    // 但释文展示本就截断，可接受。结果 JSON 里有 ok/content/error。
+    let marker = format!("__CNKI_RES__{}__", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let js = format!(
-        "(async () => {{ window.__cnkiResult=null; try {{ var r = await window.__cnkiDetail({{fn_:{fn_},tablename:{tn},product:{pd}}}); window.__cnkiResult=r; }} catch(e) {{ window.__cnkiResult={{ok:false,content:'',error:String(e)}}; }} }})();",
+        r#"(async () => {{
+  try {{
+    var SCOPES = ['content','preview','download'];
+    async function tryScope(scope){{
+      var body={{filename:{fn_},tablename:{tn}||'CRFD2025',product:{pd}||'CRFD',
+        platform:'NRBOOK',type:'REFBOOK',scope:scope,cflag:'overlay',dflag:'词条',
+        language:'CHS',pages:'',sid:'',idenid:''}};
+      var r=await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK',
+        {{method:'POST',headers:{{'Content-Type':'application/json;charset=utf-8',language:'CHS'}},
+         credentials:'include',body:JSON.stringify(body)}});
+      var j=await r.json();
+      if(j.code!==0) throw new Error(j.message||('code '+j.code));
+      var c=(j.data&&j.data.data&&j.data.data[0]&&j.data.data[0].content)||'';
+      c=c.replace(/<[^>]*>/g,'').trim();
+      if(!c) throw new Error('条目内容为空');
+      return c;
+    }}
+    var content=await Promise.any(SCOPES.map(tryScope));
+    var res={{ok:true,content:content}};
+    document.title={mk}+JSON.stringify(res);
+  }} catch(e){{
+    var msg=(e&&e.errors&&e.errors[0]&&e.errors[0].message)||(e&&e.message)||'获取失败';
+    if(/未登录|登录|403|验证参数/.test(msg)) msg='未登录或登录已过期，请在托盘菜单点击\"CNKI 登录…\"重新登录';
+    var res={{ok:false,content:'',error:msg}};
+    document.title={mk}+JSON.stringify(res);
+  }}
+}})();"#,
         fn_ = serde_json::to_string(&fn_).unwrap_or_else(|_| "\"\"".into()),
         tn = serde_json::to_string(&tablename).unwrap_or_else(|_| "\"\"".into()),
         pd = serde_json::to_string(&product).unwrap_or_else(|_| "\"\"".into()),
+        mk = serde_json::to_string(&marker).unwrap_or_else(|_| "\"\"".into()),
     );
     if let Err(e) = w.eval(&js) {
         return cnki::DetailResponse {
@@ -587,39 +619,32 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
             error: format!("调用鉴权窗口失败: {e}"),
         };
     }
-    // 轮询读取 window.__cnkiResult：eval_with_callback 返回 JSON 字符串
-    use tokio::sync::oneshot;
+    // 轮询 document.title（同步 title()），等待 marker 出现
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if std::time::Instant::now() > deadline {
             return cnki::DetailResponse {
                 ok: false, content: String::new(),
                 error: "查询超时，若未登录请在托盘菜单点击\"CNKI 登录…\"".into(),
             };
         }
-        let (tx, rx) = oneshot::channel::<String>();
-        let tx = std::sync::Mutex::new(Some(tx));
-        let probe = "JSON.stringify(window.__cnkiResult)".to_string();
-        if w.eval_with_callback(probe, move |s: String| {
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(s);
-            }
-        }).is_err() {
-            continue;
-        }
-        match tokio::time::timeout(std::time::Duration::from_millis(800), rx).await {
-            Ok(Ok(s)) => {
-                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(v) if !v.is_null() => v,
-                    _ => continue, // __cnkiResult 仍为 null，继续轮询
+        if let Ok(title) = w.title() {
+            if let Some(json_str) = title.strip_prefix(&marker) {
+                // 读到结果，恢复 title（去掉脏数据）
+                let _ = w.set_title("CNKI 登录 · 工具书查词");
+                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(json_str) {
+                    Ok(v) => v,
+                    Err(e) => return cnki::DetailResponse {
+                        ok: false, content: String::new(),
+                        error: format!("解析鉴权结果失败: {e}"),
+                    },
                 };
                 let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                 let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 return cnki::DetailResponse { ok, content, error };
             }
-            _ => continue,
         }
     }
 }
