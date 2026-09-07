@@ -251,6 +251,10 @@ fn hide_float(app: &AppHandle) {
     let state = app.state::<AppState>();
     let float = state.float.lock().unwrap().clone();
     if let Some(float) = float {
+        // 隐藏前补存最终位置（Wayland 下 outer_position 可能失败，则忽略）
+        if let Ok(pos) = float.outer_position() {
+            save_float_pos(app, pos.x, pos.y);
+        }
         let _ = float.hide();
     }
 }
@@ -296,22 +300,24 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
             "show" => show_main(app),
             "lookup" => trigger_selection_lookup(app),
             "toggle-float" => {
-                let checked = float_toggle.is_checked().unwrap_or(true);
-                let _ = float_toggle.set_checked(!checked);
+                // 从我们维护的 float_enabled 推导新状态（而非 is_checked()——
+                // 原生菜单点击时部分平台会自动翻转 check，再读 is_checked 会二次翻转导致状态不变）
                 let state = app.state::<AppState>();
-                *state.float_enabled.lock().unwrap() = !checked;
-                if checked {
-                    // 取消勾选 → 立即隐藏悬浮图标
-                    hide_float(app);
-                } else {
+                let new_enabled = !*state.float_enabled.lock().unwrap();
+                *state.float_enabled.lock().unwrap() = new_enabled;
+                let _ = float_toggle.set_checked(new_enabled);
+                if new_enabled {
                     // 重新勾选 → 主窗口当前不可见则显示悬浮图标
                     let main_visible = app
                         .get_webview_window("main")
-                        .map(|w| w.is_visible().unwrap_or(true))
-                        .unwrap_or(true);
+                        .map(|w| w.is_visible().unwrap_or(false))
+                        .unwrap_or(false);
                     if !main_visible {
                         show_float_if_enabled(app);
                     }
+                } else {
+                    // 取消勾选 → 立即隐藏悬浮图标
+                    hide_float(app);
                 }
             }
             "quit" => app.exit(0),
@@ -330,6 +336,31 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// 悬浮图标位置持久化文件（app_config_dir/float-position.json），跨会话记忆上次拖动后位置
+fn float_pos_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("float-position.json"))
+}
+
+/// 读取上次保存的悬浮图标位置（物理坐标）
+fn load_float_pos(app: &AppHandle) -> Option<(i32, i32)> {
+    let path = float_pos_file(app)?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let x = v.get("x")?.as_i64()? as i32;
+    let y = v.get("y")?.as_i64()? as i32;
+    Some((x, y))
+}
+
+/// 保存悬浮图标位置（物理坐标）
+fn save_float_pos(app: &AppHandle, x: i32, y: i32) {
+    if let Some(path) = float_pos_file(app) {
+        let v = serde_json::json!({ "x": x, "y": y });
+        let _ = std::fs::write(&path, v.to_string());
+    }
 }
 
 /// 创建桌面悬浮图标：透明置顶小窗，可拖拽，点击唤起主窗口
@@ -360,16 +391,36 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
         let _ = float.set_background_color(Some(tauri::webview::Color(15, 40, 66, 255)));
     }
 
-    // 初始定位：主屏幕右下角，留出边距
-    if let Ok(monitor) = float.primary_monitor() {
+    // 定位：优先用上次拖动后保存的位置；否则放到主屏幕右下角（含显示器原点偏移）
+    if let Some((x, y)) = load_float_pos(app) {
+        let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    } else if let Ok(monitor) = float.primary_monitor() {
         if let Some(monitor) = monitor {
             let size = monitor.size();
+            let mpos = monitor.position();
             let scale = monitor.scale_factor();
-            let x = size.width as i32 - (56.0 * scale + 32.0 * scale).round() as i32;
-            let y = size.height as i32 - (56.0 * scale + 32.0 * scale).round() as i32;
+            // 56(窗口) + 32(右边距) 逻辑像素 → 物理像素
+            let off = (56.0 * scale + 32.0 * scale).round() as i32;
+            let x = mpos.x + size.width as i32 - off;
+            let y = mpos.y + size.height as i32 - off;
             let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
         }
     }
+    // 拖动后位置持久化：Moved 事件节流写入（500ms 内只写一次），hide 时再补写最终位置
+    let app_h = app.clone();
+    let last_save = std::sync::Mutex::new(
+        std::time::Instant::now() - std::time::Duration::from_millis(600),
+    );
+    float.on_window_event(move |event| {
+        if let WindowEvent::Moved(pos) = event {
+            let mut last = last_save.lock().unwrap();
+            if last.elapsed() >= std::time::Duration::from_millis(500) {
+                *last = std::time::Instant::now();
+                drop(last);
+                save_float_pos(&app_h, pos.x, pos.y);
+            }
+        }
+    });
     // 初始不显示：主窗口可见时隐藏悬浮图标，主窗口关闭（隐藏到托盘）后才显示
     Ok(())
 }

@@ -13,7 +13,8 @@
         "label": "main",
         "title": "工具书查词 · 桌面版",
         "width": 880,
-        "height": 640
+        "height": 640,
+        "decorations": false
       }
     ],
     "security": {
