@@ -438,10 +438,16 @@ function initMain() {
       // 优先走带 cookie 的鉴权路径（需 CNKI 登录）；失败回退裸 API
       // 注意：Tauri 将 Rust 参数名 fn_ 重命名为 fn，invoke 须传 fn
       let d = await invoke('cnki_detail_auth', { fn: item.fn, tablename: item.tablename, product: item.product });
+      const authErr = d.ok ? '' : (d.error || '');
       if (!d.ok) {
         try {
           d = await invoke('cnki_detail', { fn: item.fn, tablename: item.tablename, product: item.product });
         } catch (_) {}
+        // 裸 API 无 cookie 必然拿不到全文；若鉴权路径已给出登录指引，优先展示它
+        // （裸 API 返回的"验证参数为空"等隐晦报错会掩盖未登录这个真实原因）
+        if (!d.ok && authErr && /登录|鉴权/.test(authErr)) {
+          d = { ok: false, content: '', error: authErr };
+        }
       }
       if (gen !== generation) return;
       tab.fullText = d.ok ? d.content : '';

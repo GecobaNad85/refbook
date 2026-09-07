@@ -563,9 +563,10 @@ fn open_cnki_login(app: tauri::AppHandle) {
 }
 
 /// 带 cookie 查询条目全文：在 cnki-auth webview 内执行 fetch（带 cookie），结果通过
-/// document.title 回传（External URL 页面无 __TAURI__ 全局，eval_with_callback 在
-/// 跨域页面上回调不可靠；title() 可同步读取 JS 设置的 document.title）。
-/// 前端"查看全文"调用此命令替代裸 reqwest 的 cnki_detail。
+/// document.title 分块回传（External URL 页面无 __TAURI__ 全局，eval_with_callback 在
+/// 跨域页面上回调不可靠；title() 可同步读取 JS 设置的 document.title，但实测 WebKitGTK
+/// 把 document.title 截断到 1000 字符，单块放不下完整结果，故切成小块依次写入、
+/// Rust 侧轮询累积，最后以 "DONE:<n>" 收尾）。前端"查看全文"调用此命令替代裸 reqwest 的 cnki_detail。
 #[tauri::command]
 async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String, product: String) -> cnki::DetailResponse {
     let w = match app.get_webview_window("cnki-auth") {
@@ -576,37 +577,47 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
         },
     };
     // 用唯一标记避免读到旧 title。fetch 逻辑内联，不依赖 init script 注入时机。
-    // title 容量有限（约数 KB），结果过长会被引擎截断 → content 末尾可能不完整，
-    // 但释文展示本就截断，可接受。结果 JSON 里有 ok/content/error。
+    // 标题上限 1000 字符：标记(~30) + "P:<idx>:"(~8) + 块(900) 留有余量。
+    // 块按 150ms 间隔依次写入（Rust 侧 40ms 轮询，确保每块至少被读到 3 次）。
     let marker = format!("__CNKI_RES__{}__", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let js = format!(
         r#"(async () => {{
+  var SCOPES = ['content','preview','download'];
+  async function tryScope(scope){{
+    var body={{filename:{fn_},tablename:{tn}||'CRFD2025',product:{pd}||'CRFD',
+      platform:'NRBOOK',type:'REFBOOK',scope:scope,cflag:'overlay',dflag:'词条',
+      language:'CHS',pages:'',sid:'',idenid:''}};
+    var r=await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK',
+      {{method:'POST',headers:{{'Content-Type':'application/json;charset=utf-8',language:'CHS'}},
+       credentials:'include',body:JSON.stringify(body)}});
+    var j=await r.json();
+    if(j.code!==0) throw new Error(j.message||('code '+j.code));
+    var c=(j.data&&j.data.data&&j.data.data[0]&&j.data.data[0].content)||'';
+    c=c.replace(/<[^>]*>/g,'').trim();
+    if(!c) throw new Error('条目内容为空');
+    return c;
+  }}
+  var res;
   try {{
-    var SCOPES = ['content','preview','download'];
-    async function tryScope(scope){{
-      var body={{filename:{fn_},tablename:{tn}||'CRFD2025',product:{pd}||'CRFD',
-        platform:'NRBOOK',type:'REFBOOK',scope:scope,cflag:'overlay',dflag:'词条',
-        language:'CHS',pages:'',sid:'',idenid:''}};
-      var r=await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK',
-        {{method:'POST',headers:{{'Content-Type':'application/json;charset=utf-8',language:'CHS'}},
-         credentials:'include',body:JSON.stringify(body)}});
-      var j=await r.json();
-      if(j.code!==0) throw new Error(j.message||('code '+j.code));
-      var c=(j.data&&j.data.data&&j.data.data[0]&&j.data.data[0].content)||'';
-      c=c.replace(/<[^>]*>/g,'').trim();
-      if(!c) throw new Error('条目内容为空');
-      return c;
-    }}
     var content=await Promise.any(SCOPES.map(tryScope));
-    var res={{ok:true,content:content}};
-    document.title={mk}+JSON.stringify(res);
+    res={{ok:true,content:content}};
   }} catch(e){{
     var msg=(e&&e.errors&&e.errors[0]&&e.errors[0].message)||(e&&e.message)||'获取失败';
     if(/未登录|登录|403|验证参数/.test(msg)) msg='未登录或登录已过期，请在托盘菜单点击\"CNKI 登录…\"重新登录';
-    var res={{ok:false,content:'',error:msg}};
-    document.title={mk}+JSON.stringify(res);
+    res={{ok:false,content:'',error:msg}};
   }}
+  var M={mk};
+  var payload=JSON.stringify(res);
+  var CS=900;
+  var n=Math.max(1,Math.ceil(payload.length/CS));
+  var i=0;
+  (function w(){{
+    if(i>=n){{ document.title=M+'DONE:'+n; return; }}
+    document.title=M+'P:'+i+':'+payload.slice(i*CS,(i+1)*CS);
+    i++;
+    setTimeout(w,150);
+  }})();
 }})();"#,
         fn_ = serde_json::to_string(&fn_).unwrap_or_else(|_| "\"\"".into()),
         tn = serde_json::to_string(&tablename).unwrap_or_else(|_| "\"\"".into()),
@@ -619,21 +630,29 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
             error: format!("调用鉴权窗口失败: {e}"),
         };
     }
-    // 轮询 document.title（同步 title()），等待 marker 出现
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // 轮询 document.title（同步 title()）累积分块，读到 "DONE:<n>" 后拼接解析
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut chunks: Vec<String> = Vec::new();
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         if std::time::Instant::now() > deadline {
             return cnki::DetailResponse {
                 ok: false, content: String::new(),
                 error: "查询超时，若未登录请在托盘菜单点击\"CNKI 登录…\"".into(),
             };
         }
-        if let Ok(title) = w.title() {
-            if let Some(json_str) = title.strip_prefix(&marker) {
-                // 读到结果，恢复 title（去掉脏数据）
+        let title = match w.title() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let Some(body) = title.strip_prefix(&marker) else { continue };
+        if let Some(count_str) = body.strip_prefix("DONE:") {
+            let count: usize = count_str.trim().parse().unwrap_or(0);
+            if chunks.len() >= count && chunks.iter().all(|c| !c.is_empty()) {
+                // 全部块已收到，恢复 title（去掉脏数据）
                 let _ = w.set_title("CNKI 登录 · 工具书查词");
-                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(json_str) {
+                let payload = chunks.concat();
+                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&payload) {
                     Ok(v) => v,
                     Err(e) => return cnki::DetailResponse {
                         ok: false, content: String::new(),
@@ -644,6 +663,16 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
                 let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 return cnki::DetailResponse { ok, content, error };
+            }
+            continue;
+        }
+        if let Some(rest) = body.strip_prefix("P:") {
+            if let Some(colon) = rest.find(':') {
+                if let Ok(idx) = rest[..colon].parse::<usize>() {
+                    let chunk = rest[colon + 1..].to_string();
+                    if chunks.len() <= idx { chunks.resize(idx + 1, String::new()); }
+                    chunks[idx] = chunk;
+                }
             }
         }
     }
