@@ -8,8 +8,19 @@ function esc(s) {
 function truncate(str, maxLen) {
   return str.length <= maxLen ? str : str.slice(0, maxLen) + '…';
 }
-function bookUrl(item) {
-  return item.readonlineUrl || '';
+// 生成工具书条目链接 —— 与浏览器扩展 getBookEntryUrl 一致
+// readonlineUrl (bar.cnki.net) 校验 Referer 必须来自 *.cnki.net；桌面应用经系统浏览器
+// 打开属"非CNKI域"，直接跳会被拒（来源应用不正确）。需先经 gongjushu.cnki.net 中转
+// （#cnki_redirect 由扩展脚本再跳原文页；未装扩展时落在 gongjushu 条目详情页，同样合法）。
+// 无 readonlineUrl 但有 fn 时跳到 gongjushu 条目详情页；两者都没有返回 null（渲染纯文本）。
+function getBookEntryUrl(item) {
+  if (item.readonlineUrl) {
+    return `https://gongjushu.cnki.net/rbook/detail?Fn=${encodeURIComponent(item.fn || '')}#cnki_redirect=${encodeURIComponent(item.readonlineUrl)}`;
+  }
+  if (item.fn) {
+    return `https://gongjushu.cnki.net/rbook/detail?Fn=${encodeURIComponent(item.fn)}${item.bid ? '&Bid=' + encodeURIComponent(item.bid) : ''}`;
+  }
+  return null;
 }
 
 // ---------- 弹窗：仅用于提示信息（查询结果在主窗口展示）----------
@@ -78,8 +89,9 @@ function renderResultItem(item, index, state) {
     mayHaveBtn = false;
   }
 
-  const bookLinkHtml = bookUrl(item)
-    ? `<a class="tb-book-link" data-url="${esc(bookUrl(item))}">《${esc(item.bookName)}》</a>`
+  const entryUrl = getBookEntryUrl(item);
+  const bookLinkHtml = entryUrl
+    ? `<a class="tb-book-link" data-url="${esc(entryUrl)}">《${esc(item.bookName)}》</a>`
     : `《${esc(item.bookName)}》`;
 
   return `
