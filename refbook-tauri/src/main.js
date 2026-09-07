@@ -197,13 +197,17 @@ function renderResultItem(item, idx, tab) {
   const isFirst = idx === 0;
   let abstractHtml;
   let mayHaveBtn = false;
+  let btnText = '查看全文';
 
   if (!isExpanded) {
     const maxChars = isFirst ? 500 : 200;
     abstractHtml = esc(truncate(item.abstract || '', maxChars));
     mayHaveBtn = isFirst && item.fn ? true : false;
   } else {
-    const displayText = tab.fullText !== '' ? tab.fullText : (item.abstract || '');
+    // 已展开且是首条：使用完整释文（如果已获取到）或摘要兜底
+    const fullTextLoaded = tab.fullText !== '';
+    const loading = tab.fetchError === '加载中…';
+    const displayText = fullTextLoaded ? tab.fullText : (item.abstract || '');
     if (displayText) {
       if (displayText.length > 500) {
         abstractHtml = esc(truncate(displayText, 500))
@@ -211,7 +215,22 @@ function renderResultItem(item, idx, tab) {
       } else {
         abstractHtml = esc(displayText);
       }
+      // 全文未成功获取（仅以摘要兜底展示）时保留"查看全文"按钮供重试
+      if (isFirst && item.fn && !fullTextLoaded) {
+        mayHaveBtn = true;
+        if (loading) {
+          btnText = '加载中…';
+          abstractHtml += '<div style="color:#999;font-size:12px;margin-top:4px;">正在获取全文…</div>';
+        } else if (tab.fetchError) {
+          abstractHtml += `<div style="color:#b94a48;font-size:12px;margin-top:4px;">${esc(tab.fetchError)}，可点击下方按钮重试</div>`;
+        }
+      }
+    } else if (loading) {
+      abstractHtml = '<span style="color:#999;font-size:12px;">正在获取全文…</span>';
+      mayHaveBtn = isFirst && item.fn;
+      btnText = '加载中…';
     } else {
+      // 全文和摘要均为空，显示提示并保留"查看全文"按钮
       const err = tab.fetchError ? esc(tab.fetchError) : '获取释文失败';
       abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" data-act="login">点此登录 CNKI</a> 后重试</span>`;
       mayHaveBtn = true;
@@ -227,7 +246,7 @@ function renderResultItem(item, idx, tab) {
     <div class="tb-result ${idx > 0 ? 'tb-result-border' : ''}">
       <div class="tb-word">${esc(item.title)}</div>
       <div class="tb-abstract">${abstractHtml}</div>
-      ${mayHaveBtn ? '<button class="tb-fulltext-btn">查看全文</button>' : ''}
+      ${mayHaveBtn ? `<button class="tb-fulltext-btn">${btnText}</button>` : ''}
       <div class="tb-source">来源：${bookLinkHtml}</div>
       <div class="tb-meta">
         ${item.subject ? `<span class="tb-tag">${esc(item.subject)}</span>` : ''}
@@ -406,6 +425,7 @@ function initMain() {
   function onFullText() {
     const tab = tabs[activeIndex];
     if (!tab) return;
+    if (tab.fetchError === '加载中…') return; // 正在获取，忽略重复点击
     tab.expanded = true;
     fetchFullText(tab, tab.items[0], generation);
   }
