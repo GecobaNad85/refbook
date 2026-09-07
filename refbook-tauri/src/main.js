@@ -12,28 +12,12 @@ function bookUrl(item) {
   return item.readonlineUrl || '';
 }
 
-// 弹窗模式：由 popup:query 事件触发切换（不依赖 URL hash，因为 Tauri 2 的 hash 设置时序不可靠）
-// 主窗口模式：默认初始化，收到 popup:query 时切换为弹窗
+// ---------- 弹窗：仅用于提示信息（查询结果在主窗口展示）----------
+// 主窗口模式默认初始化；收到 popup:message 时说明当前窗口是提示弹窗，切换视图
 let popupInited = false;
-const popupState = { expandedFirst: false, firstFullText: '' };
-let popupResults = [];
-let popupKeyword = '';
 let popupContainer = null;
 
-// 先初始化主窗口
 initMain();
-
-// 监听 popup:query —— 若主窗口收到，说明当前窗口实际是弹窗，切换视图
-listen('popup:query', (e) => {
-  if (!popupInited) {
-    // 隐藏主窗口视图，显示弹窗视图
-    document.getElementById('main-view').hidden = true;
-    popupContainer = document.getElementById('popup-view');
-    popupContainer.hidden = false;
-    popupInited = true;
-  }
-  lookupPopup(e.payload);
-});
 
 listen('popup:message', (e) => {
   if (!popupInited) {
@@ -43,52 +27,27 @@ listen('popup:message', (e) => {
     popupInited = true;
   }
   const m = e.payload;
-  popupContainer.innerHTML = `<div class="tb-popup"><div class="tb-body"><div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}">${esc(m.msg)}</div></div></div>`;
+  popupContainer.innerHTML = `
+    <div class="tb-popup">
+      <div class="tb-header">
+        <span class="tb-title">工具书查词</span>
+        <button class="tb-close" data-act="close">×</button>
+      </div>
+      <div class="tb-body">
+        <div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}">${esc(m.msg)}</div>
+      </div>
+    </div>`;
+  popupContainer.onclick = (e2) => {
+    if (e2.target instanceof Element && e2.target.classList.contains('tb-close')) {
+      invoke('popup_close');
+    }
+  };
 });
 
-function lookupPopup(word) {
-  popupKeyword = word;
-  popupState.expandedFirst = false;
-  popupState.firstFullText = '';
-  popupContainer.innerHTML = `<div class="tb-popup"><div class="tb-body"><div class="tb-loading-msg"><span class="tb-spinner"></span>正在CNKI工具书总库查询...</div></div></div>`;
-  invoke('cnki_search', { word, size: 5 }).then((j) => {
-    if (!j.ok) {
-      popupContainer.innerHTML = `<div class="tb-popup"><div class="tb-body"><div class="tb-error-msg">${esc(j.error || '查询失败')}</div></div></div>`;
-      return;
-    }
-    popupResults = j.results || [];
-    renderPopupResults();
-    if (popupResults.length && popupResults[0].fn) fetchPopupFullText();
-  }).catch((e) => {
-    popupContainer.innerHTML = `<div class="tb-popup"><div class="tb-body"><div class="tb-error-msg">请求出错：${esc(String(e))}</div></div></div>`;
-  });
-}
-
-function renderPopupResults() {
-  renderResults(popupContainer, popupResults, popupKeyword, popupState, () => fetchPopupFullText(), onPopupExpand, () => {
-    invoke('popup_open_external', { url: 'https://gongjushu.cnki.net/rbook/search/simplesearch?key=' + encodeURIComponent(popupKeyword) });
-  });
-}
-
-function fetchPopupFullText() {
-  const first = popupResults[0];
-  if (!first) return;
-  invoke('cnki_detail', { fn_: first.fn, tablename: first.tablename, product: first.product }).then((d) => {
-    popupState.firstFullText = d.ok ? d.content : '';
-    popupState.expandedFirst = true;
-    renderPopupResults();
-  }).catch(() => {});
-}
-
-function onPopupExpand(toggle, target) {
-  const raw = decodeURIComponent(toggle.dataset.raw || '');
-  const abstractDiv = toggle.closest('.tb-abstract');
-  if (target.textContent === '展开') {
-    abstractDiv.innerHTML = esc(raw) + `<span class="tb-expand-toggle" data-raw="${encodeURIComponent(raw)}">收起</span>`;
-  } else {
-    abstractDiv.innerHTML = esc(truncate(raw, 500)) + `<span class="tb-expand-toggle" data-raw="${encodeURIComponent(raw)}">展开</span>`;
-  }
-}
+// ESC 关闭弹窗（在主窗口中按 ESC 时 popup_close 为安全空操作）
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') invoke('popup_close');
+});
 
 // ---------- 共享：渲染单条结果（与扩展 renderResultItem 一致）----------
 // state: { expandedFirst, firstFullText }
@@ -136,50 +95,6 @@ function renderResultItem(item, index, state) {
   `;
 }
 
-// 渲染整个结果列表到容器
-function renderResults(container, results, keyword, state, onFullText, onExpand, onFooter) {
-  if (!results || results.length === 0) {
-    container.innerHTML = `
-      <div class="tb-popup">
-        <div class="tb-header">
-          <span class="tb-title">CNKI工具书总库</span>
-          <button class="tb-close" data-act="close">×</button>
-        </div>
-        <div class="tb-body">
-          <div class="tb-empty-msg">在CNKI工具书总库中未找到相关释义</div>
-        </div>
-      </div>`;
-    return;
-  }
-  container.innerHTML = `
-    <div class="tb-popup">
-      <div class="tb-header">
-        <span class="tb-title">CNKI工具书总库</span>
-        <span class="tb-count">${results.length} 条结果</span>
-      </div>
-      <div class="tb-body">
-        ${results.map((item, i) => renderResultItem(item, i, state)).join('')}
-      </div>
-      <a class="tb-footer" data-act="footer">在CNKI工具书总库查看更多释义 →</a>
-    </div>`;
-
-  // 事件委托
-  container.onclick = (e) => {
-    if (!(e.target instanceof Element)) return;
-    if (e.target.classList.contains('tb-fulltext-btn') && onFullText) { onFullText(); return; }
-    const toggle = e.target.closest('.tb-expand-toggle');
-    if (toggle && onExpand) { onExpand(toggle, e.target); return; }
-    const bookLink = e.target.closest('.tb-book-link');
-    if (bookLink && bookLink.dataset.url) { invoke('popup_open_external', { url: bookLink.dataset.url }); return; }
-    if (e.target.classList.contains('tb-close')) { invoke('popup_close'); return; }
-    if (e.target.closest('.tb-footer') && onFooter) { onFooter(); return; }
-  };
-}
-
-function loadingHtml(msg) {
-  return `<div class="tb-popup"><div class="tb-body"><div class="tb-loading-msg"><span class="tb-spinner"></span>${esc(msg || '正在CNKI工具书总库查询...')}</div></div></div>`;
-}
-
 // 主窗口：结果项作为独立卡片直接列在搜索框下方（不套弹窗容器）
 function renderMainResults(container, results, state, onFullText, onExpand) {
   if (!results || results.length === 0) {
@@ -204,6 +119,14 @@ function initMain() {
   const searchBtn = document.getElementById('search-btn');
   const resultsEl = document.getElementById('results');
   const statusDot = document.getElementById('status-dot');
+
+  // 划词快捷键（Ctrl+Alt+D）唤起主窗口后自动查询
+  listen('main:query', (e) => {
+    const word = String(e.payload || '').trim();
+    if (!word) return;
+    input.value = word;
+    doSearch();
+  });
 
   let lastResults = [];
   let lastKeyword = '';

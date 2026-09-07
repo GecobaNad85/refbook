@@ -32,26 +32,60 @@ async fn cnki_ping() -> bool {
     cnki::ping().await
 }
 
-/// 读取系统选中文本：Linux 读 X11/Wayland PRIMARY 选区，其他平台读剪贴板
+/// 读取系统选中文本：优先 PRIMARY 选区（划词即存入，无需复制），回退剪贴板
 fn get_selection_text() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        // X11 PRIMARY selection：选中文字即存入，无需复制
-        if let Some(text) = read_x11_primary() {
-            let t = text.trim().to_string();
-            if !t.is_empty() {
-                return t;
-            }
+    let primary = read_primary_selection();
+    if !primary.is_empty() {
+        return primary;
+    }
+    read_clipboard()
+}
+
+#[cfg(target_os = "linux")]
+fn read_primary_selection() -> String {
+    // Wayland 会话：原生应用（如 Chrome）的选区走 Wayland 协议，X11 读不到 → 优先 wl-paste --primary
+    if is_wayland_session() {
+        if let Some(s) = read_wayland_primary() {
+            return s;
         }
-        // Wayland 会话下 X11 协议读不到原生应用的 PRIMARY 选区，改用 wl-paste --primary
-        if let Some(text) = read_wayland_primary() {
+        if let Some(s) = read_x11_primary() {
+            return s;
+        }
+    } else {
+        if let Some(s) = read_x11_primary() {
+            return s;
+        }
+        if let Some(s) = read_wayland_primary() {
+            return s;
+        }
+    }
+    String::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_primary_selection() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_clipboard() -> String {
+    // 先 wl-paste（Wayland 剪贴板，比 arboard 更可靠），再 arboard
+    if let Some(s) = read_wayland_clipboard() {
+        return s;
+    }
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if let Ok(text) = cb.get_text() {
             let t = text.trim().to_string();
             if !t.is_empty() {
                 return t;
             }
         }
     }
-    // 回退：读剪贴板
+    String::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_clipboard() -> String {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         if let Ok(text) = cb.get_text() {
             let t = text.trim().to_string();
@@ -64,10 +98,57 @@ fn get_selection_text() -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|v| v.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+}
+
+/// 执行 wl-paste 并设 1.5s 超时，避免选区所有者无响应时卡住主线程
+#[cfg(target_os = "linux")]
+fn run_wl_paste(args: &[&str]) -> Option<std::process::Output> {
+    use std::process::{Command, Stdio};
+    let child = Command::new("wl-paste")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+        Ok(out) => out.ok(),
+        Err(_) => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_wayland_primary() -> Option<String> {
+    let out = run_wl_paste(&["--primary"])?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(target_os = "linux")]
+fn read_wayland_clipboard() -> Option<String> {
+    let out = run_wl_paste(&[])?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(target_os = "linux")]
 fn read_x11_primary() -> Option<String> {
     let clipboard = x11_clipboard::Clipboard::new().ok()?;
     let atoms = &clipboard.getter.atoms;
-    // load 带超时（load_wait 会无限阻塞快捷键回调），超时即跳过走 Wayland 回退
+    // load 带超时（load_wait 会无限阻塞快捷键回调），超时即跳过
     let bytes = clipboard
         .load(
             atoms.primary,
@@ -81,70 +162,69 @@ fn read_x11_primary() -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Wayland PRIMARY 选区读取：依赖 wl-clipboard 提供的 wl-paste 命令行工具
-#[cfg(target_os = "linux")]
-fn read_wayland_primary() -> Option<String> {
-    let out = std::process::Command::new("wl-paste")
-        .arg("--primary")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// 触发划词查询：读选区 → 唤起主窗口查询；选区为空则在弹窗提示
+fn trigger_selection_lookup(app: &tauri::AppHandle) {
+    let text = get_selection_text();
+    if text.trim().is_empty() {
+        show_popup_message(
+            app,
+            "未检测到选中文本。请先选中文字；若为 Chrome 浏览器，建议先按 Ctrl+C 复制，再按 Ctrl+Alt+D。",
+            true,
+        );
+        return;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    // 唤起主窗口并在主窗口查询（结果在主窗口完整展示，弹窗不再承载结果）
+    show_main(app);
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.emit("main:query", text.trim().to_string());
+    }
 }
 
-/// 触发划词查询：读选区 → 显示弹窗 → 通知前端查询
-fn trigger_selection_lookup(app: &tauri::AppHandle, state: &AppState) {
-    let text = get_selection_text();
-    let win = {
-        let mut guard = state.popup.lock().unwrap();
-        if guard.is_none() {
-            let popup = tauri::WebviewWindowBuilder::new(
-                app,
-                "popup",
-                tauri::WebviewUrl::App("index.html".into()),
-            )
-            .title("划词查询")
-            .inner_size(420.0, 460.0)
-            .decorations(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .resizable(true)
-            .visible(false)
-            .build()
-            .ok();
-            *guard = popup;
-        }
-        guard.clone().unwrap()
-    };
-
-    // 定位到屏幕中央偏上
-    if let Ok(monitor) = win.current_monitor() {
-        if let Some(monitor) = monitor {
-            let size = monitor.size();
-            let scale = monitor.scale_factor();
-            let w = 420.0 * scale;
-            let h = 460.0 * scale;
-            let x = (size.width as f64 - w) / 2.0 / scale;
-            let y = (size.height as f64 - h) / 4.0 / scale;
-            let _ = win.set_position(tauri::Position::Logical(
-                tauri::LogicalPosition::new(x, y),
-            ));
-        }
+/// 获取（或创建）划词提示弹窗
+fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
+    let state = app.state::<AppState>();
+    let mut guard = state.popup.lock().unwrap();
+    if guard.is_none() {
+        let popup = tauri::WebviewWindowBuilder::new(
+            app,
+            "popup",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("划词查询")
+        .inner_size(440.0, 190.0)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .visible(false)
+        .build()
+        .ok();
+        *guard = popup;
     }
+    guard.clone()
+}
 
-    let _ = win.show();
-    let _ = set_focus_delayed(&win);
-
-    // 通过 eval 设置 popup 模式（hash 方式在 Tauri 2 不可靠）
-    let _ = win.eval("window.location.hash = 'popup';");
-
-    if text.is_empty() {
-        let _ = win.emit("popup:message", serde_json::json!({"msg": "（未检测到选中文本，请先选中文字或复制词目）", "isError": true}));
-    } else {
-        let _ = win.emit("popup:query", &text);
+/// 在弹窗中显示提示信息（可关闭）
+fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
+    if let Some(win) = get_or_create_popup(app) {
+        // 定位到屏幕中央偏上
+        if let Ok(monitor) = win.current_monitor() {
+            if let Some(monitor) = monitor {
+                let size = monitor.size();
+                let scale = monitor.scale_factor();
+                let w = 440.0 * scale;
+                let h = 190.0 * scale;
+                let x = (size.width as f64 - w) / 2.0 / scale;
+                let y = (size.height as f64 - h) / 4.0 / scale;
+                let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+            }
+        }
+        let _ = win.show();
+        let _ = set_focus_delayed(&win);
+        let _ = win.emit(
+            "popup:message",
+            serde_json::json!({"msg": msg, "isError": is_error}),
+        );
     }
 }
 
@@ -157,31 +237,34 @@ fn set_focus_delayed(win: &WebviewWindow) {
     });
 }
 
-/// 显示并聚焦主窗口（托盘 / 悬浮图标 / IPC 共用）
+/// 显示并聚焦主窗口（托盘 / 悬浮图标 / IPC 共用），同时隐藏悬浮图标入口
 fn show_main(app: &AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.show();
         let _ = main.set_focus();
     }
-    // 主窗口可见时隐藏悬浮图标入口
-    sync_float_with_main(app);
+    hide_float(app);
 }
 
-/// 悬浮图标与主窗口联动：主窗口可见 → 隐藏悬浮图标；主窗口关闭（隐藏）后 → 显示
-fn sync_float_with_main(app: &AppHandle) {
+/// 隐藏悬浮图标
+fn hide_float(app: &AppHandle) {
     let state = app.state::<AppState>();
     let float = state.float.lock().unwrap().clone();
-    let enabled = *state.float_enabled.lock().unwrap();
-    let main_visible = app
-        .get_webview_window("main")
-        .map(|w| w.is_visible().unwrap_or(false))
-        .unwrap_or(false);
     if let Some(float) = float {
-        if main_visible || !enabled {
-            let _ = float.hide();
-        } else {
-            let _ = float.show();
-        }
+        let _ = float.hide();
+    }
+}
+
+/// 显示悬浮图标（受托盘"显示悬浮图标"开关约束）
+fn show_float_if_enabled(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let enabled = *state.float_enabled.lock().unwrap();
+    if !enabled {
+        return;
+    }
+    let float = state.float.lock().unwrap().clone();
+    if let Some(float) = float {
+        let _ = float.show();
     }
 }
 
@@ -211,16 +294,25 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main(app),
-            "lookup" => {
-                let state = app.state::<AppState>();
-                trigger_selection_lookup(app, state.inner());
-            }
+            "lookup" => trigger_selection_lookup(app),
             "toggle-float" => {
                 let checked = float_toggle.is_checked().unwrap_or(true);
                 let _ = float_toggle.set_checked(!checked);
                 let state = app.state::<AppState>();
                 *state.float_enabled.lock().unwrap() = !checked;
-                sync_float_with_main(app);
+                if checked {
+                    // 取消勾选 → 立即隐藏悬浮图标
+                    hide_float(app);
+                } else {
+                    // 重新勾选 → 主窗口当前不可见则显示悬浮图标
+                    let main_visible = app
+                        .get_webview_window("main")
+                        .map(|w| w.is_visible().unwrap_or(true))
+                        .unwrap_or(true);
+                    if !main_visible {
+                        show_float_if_enabled(app);
+                    }
+                }
             }
             "quit" => app.exit(0),
             _ => {}
@@ -316,8 +408,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
-                    let state = app_handle.state::<AppState>();
-                    trigger_selection_lookup(&app_handle, state.inner());
+                    trigger_selection_lookup(&app_handle);
                 }
             })?;
 
@@ -334,12 +425,17 @@ pub fn run() {
                 }
                 let win = main.clone();
                 main.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = win.hide();
-                        // 主窗口已隐藏到托盘 → 显示悬浮图标入口
-                        let app = win.app_handle();
-                        sync_float_with_main(app);
+                    let app = win.app_handle();
+                    match event {
+                        // 主窗口"关闭"→ 隐藏到托盘，显示悬浮图标入口
+                        WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            let _ = win.hide();
+                            show_float_if_enabled(&app);
+                        }
+                        // 主窗口重新获得焦点（托盘 / 任务栏 / 悬浮图标唤起）→ 隐藏悬浮图标
+                        WindowEvent::Focused(true) => hide_float(&app),
+                        _ => {}
                     }
                 });
             }
