@@ -9,9 +9,8 @@ function truncate(str, maxLen) {
   return str.length <= maxLen ? str : str.slice(0, maxLen) + '…';
 }
 // 生成工具书条目链接 —— 与浏览器扩展 getBookEntryUrl 一致
-// readonlineUrl (bar.cnki.net) 校验 Referer 必须来自 *.cnki.net；桌面应用经系统浏览器
-// 打开属"非CNKI域"，直接跳会被拒（来源应用不正确）。需先经 gongjushu.cnki.net 中转
-// （#cnki_redirect 由扩展脚本再跳原文页；未装扩展时落在 gongjushu 条目详情页，同样合法）。
+// readonlineUrl (bar.cnki.net) 校验 Referer 必须来自 *.cnki.net；桌面应用经内置 webview
+// 打开 gongjushu.cnki.net 中转页（Referer 建立），由注入脚本读取 #cnki_redirect 跳到原文页。
 // 无 readonlineUrl 但有 fn 时跳到 gongjushu 条目详情页；两者都没有返回 null（渲染纯文本）。
 function getBookEntryUrl(item) {
   if (item.readonlineUrl) {
@@ -62,7 +61,6 @@ window.addEventListener('keydown', (e) => {
 // 分词与繁简转换（移植自浏览器扩展 content.js，去 sandbox 直接用 CDN 全局）
 // ============================================================
 
-// SegmentIt / OpenCC 就绪 Promise（10s 超时；失败则各自降级）
 let _segmentitPromise = null;
 let _openccPromise = null;
 let _segmenter = null;
@@ -158,7 +156,6 @@ async function segmentWithSegmentIt(text) {
   }
 }
 
-// 对文本进行分词，生成候选词段
 async function segmentKeywordSmart(text) {
   const smartSegs = await segmentWithSegmentIt(text);
   if (smartSegs && smartSegs.length > 0) return smartSegs;
@@ -182,7 +179,6 @@ function selectNonOverlapping(segmentsWithResults, textLen) {
   return selected;
 }
 
-// OpenCC 繁→简；不可用或超时返回 null
 async function toSimplified(text) {
   const OpenCC = await waitForOpencc();
   if (!OpenCC) return null;
@@ -195,10 +191,10 @@ async function toSimplified(text) {
 }
 
 // ---------- 共享：渲染单条结果（与扩展 renderResultItem 一致）----------
-// state: { expandedKey, expandedFullText }；key 为该项在扁平列表中的索引字符串
-function renderResultItem(item, key, state, firstKey) {
-  const isExpanded = state.expandedKey === key;
-  const isFirst = key === firstKey;
+// tab: { keyword, items, fullText, expanded } —— 每个标签独立维护展开状态与全文
+function renderResultItem(item, idx, tab) {
+  const isExpanded = tab.expanded && idx === 0;
+  const isFirst = idx === 0;
   let abstractHtml;
   let mayHaveBtn = false;
 
@@ -207,7 +203,7 @@ function renderResultItem(item, key, state, firstKey) {
     abstractHtml = esc(truncate(item.abstract || '', maxChars));
     mayHaveBtn = isFirst && item.fn ? true : false;
   } else {
-    const displayText = state.expandedFullText !== '' ? state.expandedFullText : (item.abstract || '');
+    const displayText = tab.fullText !== '' ? tab.fullText : (item.abstract || '');
     if (displayText) {
       if (displayText.length > 500) {
         abstractHtml = esc(truncate(displayText, 500))
@@ -227,7 +223,7 @@ function renderResultItem(item, key, state, firstKey) {
     : `《${esc(item.bookName)}》`;
 
   return `
-    <div class="tb-result ${key !== '0' ? 'tb-result-border' : ''}">
+    <div class="tb-result ${idx > 0 ? 'tb-result-border' : ''}">
       <div class="tb-word">${esc(item.title)}</div>
       <div class="tb-abstract">${abstractHtml}</div>
       ${mayHaveBtn ? '<button class="tb-fulltext-btn">查看全文</button>' : ''}
@@ -249,7 +245,6 @@ function initMain() {
   const resultsEl = document.getElementById('results');
   const statusDot = document.getElementById('status-dot');
 
-  // 自定义窗口控制按钮（替代 Linux 下常失灵的原生标题栏）
   initWindowControls();
 
   // 划词快捷键（Ctrl+Alt+D）唤起主窗口后自动查询
@@ -263,13 +258,12 @@ function initMain() {
   invoke('cnki_ping').then((ok) => { statusDot.className = 'status ' + (ok ? 'ok' : 'bad'); })
     .catch(() => { statusDot.className = 'status bad'; });
 
-  // 当前查询的全部结果：currentGroups = [{ seg, items }]（seg=null 表示整词命中）
-  let currentGroups = [];
+  // 标签状态（移植扩展 tabState）：整词命中为单标签（不显示标签头）；分词命中为多标签
+  let tabs = [];          // [{ keyword, items, fullText, expanded }]
+  let activeIndex = 0;
   let currentKeyword = '';
-  let renderedItems = []; // 扁平化结果项，供事件委托按索引定位
-  // 搜索代数：作废过期异步回调（用户发起新查询后，旧查询结果不再渲染）
+  // 搜索代数：作废过期异步回调
   let generation = 0;
-  const state = { expandedKey: null, expandedFullText: '' };
 
   function setLoading(msg) {
     resultsEl.innerHTML = '<div class="main-loading"><span class="tb-spinner"></span> ' + esc(msg) + '</div>';
@@ -281,29 +275,46 @@ function initMain() {
     resultsEl.innerHTML = '<div class="main-empty">在CNKI工具书总库中未找到相关释义</div>';
   }
 
+  // 渲染当前标签集（标签头横向并排 + 活动标签内容）
   function render() {
-    if (renderedItems.length === 0) { renderEmpty(); return; }
+    if (tabs.length === 0) { renderEmpty(); return; }
+    const showTabs = tabs.length > 1;
     let html = '';
-    let idx = 0;
-    for (const g of currentGroups) {
-      if (g.seg) {
-        html += `<div class="tb-segment-header">分词检索：<b>${esc(g.seg)}</b> · ${g.items.length} 条</div>`;
-      }
-      for (const item of g.items) {
-        html += renderResultItem(item, String(idx), state, '0');
-        idx++;
-      }
+    if (showTabs) {
+      html += '<div class="tb-tabs">';
+      tabs.forEach((t, i) => {
+        // 原词标签（index 0）即使无结果也显示；分词标签只显示有结果的
+        if (i !== 0 && t.items.length === 0) return;
+        const cls = i === activeIndex ? 'tb-tab active' : 'tb-tab';
+        const cnt = t.items.length > 0 ? `<span class="tb-tab-count">${t.items.length}</span>` : '';
+        html += `<div class="${cls}" data-tab="${i}">${esc(t.keyword)}${cnt}</div>`;
+      });
+      html += '</div>';
+    }
+    const tab = tabs[activeIndex];
+    if (!tab || tab.items.length === 0) {
+      html += '<div class="main-empty">该分词未命中结果</div>';
+    } else {
+      html += tab.items.map((item, idx) => renderResultItem(item, idx, tab)).join('');
     }
     resultsEl.innerHTML = html;
   }
 
   resultsEl.onclick = (e) => {
     if (!(e.target instanceof Element)) return;
+    // 切换标签
+    const tabBtn = e.target.closest('.tb-tab');
+    if (tabBtn && tabBtn.dataset.tab != null) {
+      activeIndex = Number(tabBtn.dataset.tab);
+      render();
+      autoFetchActive(generation);
+      return;
+    }
     if (e.target.classList.contains('tb-fulltext-btn')) { onFullText(); return; }
     const toggle = e.target.closest('.tb-expand-toggle');
     if (toggle) { onExpand(toggle); return; }
     const bookLink = e.target.closest('.tb-book-link');
-    if (bookLink && bookLink.dataset.url) { invoke('popup_open_external', { url: bookLink.dataset.url }); return; }
+    if (bookLink && bookLink.dataset.url) { invoke('open_entry_url', { url: bookLink.dataset.url }); return; }
   };
 
   // ---------- 查询链（移植扩展 runQueryChain / queryWithSegmentation）----------
@@ -323,13 +334,12 @@ function initMain() {
 
     const data = j.results || [];
     if (data.length > 0) {
-      currentGroups = [{ seg: null, items: data }];
+      // 整词命中：单标签，不显示标签头
+      tabs = [{ keyword, items: data, fullText: '', expanded: false }];
+      activeIndex = 0;
       currentKeyword = keyword;
-      renderedItems = data.slice();
-      state.expandedKey = null;
-      state.expandedFullText = '';
       render();
-      autoFetchFirst(gen);
+      autoFetchActive(gen);
       return true;
     }
 
@@ -354,22 +364,15 @@ function initMain() {
     const selected = selectNonOverlapping(withResults, textLen);
     if (selected.length === 0) return false;
 
+    // 构建标签：[原词(空)] + 各命中分词
+    tabs = [
+      { keyword, items: [], fullText: '', expanded: false },
+      ...selected.map((r) => ({ keyword: r.seg.text, items: r.results, fullText: '', expanded: false })),
+    ];
+    activeIndex = 1; // 第一个有结果的分词标签
     currentKeyword = keyword;
-    currentGroups = selected.map((r) => ({ seg: r.seg.text, items: r.results }));
-    renderedItems = currentGroups.flatMap((g) => g.items);
-    state.expandedKey = null;
-    state.expandedFullText = '';
-    let html = '<div class="tb-segment-note">整词未命中，以下为分词检索结果：</div>';
-    let idx = 0;
-    for (const g of currentGroups) {
-      html += `<div class="tb-segment-header">分词检索：<b>${esc(g.seg)}</b> · ${g.items.length} 条</div>`;
-      for (const item of g.items) {
-        html += renderResultItem(item, String(idx), state, '0');
-        idx++;
-      }
-    }
-    resultsEl.innerHTML = html;
-    autoFetchFirst(gen);
+    render();
+    autoFetchActive(gen);
     return true;
   }
 
@@ -379,7 +382,6 @@ function initMain() {
     let hit = await runQueryChain(keyword, gen);
     if (gen !== generation) return;
     if (hit) return;
-    // 繁→简兜底
     setLoading('未命中，正在尝试简体补查...');
     const simplified = await toSimplified(keyword);
     if (gen !== generation) return;
@@ -389,24 +391,26 @@ function initMain() {
     if (!hit) renderEmpty();
   }
 
-  function autoFetchFirst(gen) {
-    const first = renderedItems[0];
-    if (first && first.fn) {
-      state.expandedKey = '0';
-      fetchFullText(first, gen);
-    }
+  // 自动获取活动标签首条的完整释文（与扩展 autoFetchExpandFirst 一致）
+  function autoFetchActive(gen) {
+    const tab = tabs[activeIndex];
+    if (!tab || tab.items.length === 0) return;
+    const first = tab.items[0];
+    if (!first.fn || tab.fullText !== '' || tab.expanded) return;
+    tab.expanded = true;
+    fetchFullText(tab, first, gen);
   }
   function onFullText() {
-    const first = renderedItems[0];
-    if (!first) return;
-    state.expandedKey = '0';
-    fetchFullText(first, generation);
+    const tab = tabs[activeIndex];
+    if (!tab) return;
+    tab.expanded = true;
+    fetchFullText(tab, tab.items[0], generation);
   }
-  async function fetchFullText(item, gen) {
+  async function fetchFullText(tab, item, gen) {
     try {
       const d = await invoke('cnki_detail', { fn_: item.fn, tablename: item.tablename, product: item.product });
       if (gen !== generation) return;
-      state.expandedFullText = d.ok ? d.content : '';
+      tab.fullText = d.ok ? d.content : '';
       render();
     } catch (e) { /* 静默失败，保留按钮 */ }
   }

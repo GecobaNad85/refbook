@@ -91,13 +91,27 @@ body {
 .win-close:hover { background: #e81123; color: #fff; }
 .win-close::before { content: "✕"; font-size: 12px; }
 
-/* 分词检索：每个分词小节标题 */
-.tb-segment-header {
-  max-width: 820px; margin: 14px auto 6px; padding: 4px 10px;
-  font-size: 12px; color: #666; background: #eef1ff; border-left: 3px solid #2347ff;
-  border-radius: 4px;
+/* 分词检索：横向并排标签（与扩展 renderTabbedResults 一致） */
+.tb-tabs {
+  max-width: 820px; margin: 0 auto 10px;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  border-bottom: 1px solid #e8e8e8; padding-bottom: 8px;
 }
-.tb-segment-header b { color: #2347ff; font-weight: 600; margin: 0 4px; }
+.tb-tab {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 12px; font-size: 13px; color: #555;
+  background: #f0f2f5; border: 1px solid transparent; border-radius: 16px;
+  cursor: pointer; user-select: none; max-width: 200px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tb-tab:hover { background: #e4e8f0; color: #333; }
+.tb-tab.active { background: #2347ff; color: #fff; }
+.tb-tab-count {
+  display: inline-block; min-width: 16px; padding: 0 5px; text-align: center;
+  font-size: 11px; line-height: 14px; border-radius: 8px;
+  background: rgba(0,0,0,0.12); color: inherit;
+}
+.tb-tab.active .tb-tab-count { background: rgba(255,255,255,0.25); }
 .tb-segment-note {
   max-width: 820px; margin: 10px auto 6px; padding: 6px 10px;
   font-size: 12px; color: #b8860b; background: #fff8e1; border-radius: 4px;

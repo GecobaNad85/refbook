@@ -438,6 +438,52 @@ fn popup_open_external(app: tauri::AppHandle, url: String) {
     let _ = app;
 }
 
+/// 打开工具书条目链接（readonlineUrl 经 gongjushu.cnki.net 中转）。
+/// 用内置 webview 打开 gongjushu 页面并注入初始化脚本，复刻扩展 content.js 的
+/// handleCnkiRedirect：读 #cnki_redirect → 校验目标为 *.cnki.net → 跳转原文页。
+/// 这样系统浏览器无需安装扩展，Referer 也由 gongjushu.cnki.net 域内跳转自然建立。
+#[tauri::command]
+fn open_entry_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    const LABEL: &str = "entry-viewer";
+    // 初始化脚本：在 gongjushu.cnki.net 页面加载时立即处理 #cnki_redirect
+    let init_script = r#"
+(function () {
+  try {
+    if (!window.location.hostname.endsWith('.cnki.net')) return;
+    var m = window.location.hash && window.location.hash.match(/#cnki_redirect=(.+)/);
+    if (!m) return;
+    var t = decodeURIComponent(m[1]);
+    try {
+      var u = new URL(t);
+      if (u.protocol !== 'https:' || (!u.hostname.endsWith('.cnki.net') && u.hostname !== 'cnki.net')) return;
+    } catch (_) { return; }
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    location.href = t;
+  } catch (_) {}
+})();
+"#;
+    // 复用已有窗口：直接导航到新 URL（init_script 仍会处理 hash）
+    if let Some(w) = app.get_webview_window(LABEL) {
+        let js = format!(
+            "window.location.href = {};",
+            serde_json::to_string(&url).map_err(|e| format!("序列化 URL 失败: {e}"))?
+        );
+        let _ = w.eval(&js);
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let parsed: tauri::Url = url
+        .parse()
+        .map_err(|e| format!("无效 URL: {e}"))?;
+    WebviewWindowBuilder::new(&app, LABEL, WebviewUrl::External(parsed))
+        .title("工具书条目")
+        .inner_size(960.0, 720.0)
+        .initialization_script(init_script)
+        .build()
+        .map_err(|e| format!("打开失败: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn focus_main(app: tauri::AppHandle) {
     show_main(&app);
@@ -498,6 +544,7 @@ pub fn run() {
             cnki_ping,
             popup_close,
             popup_open_external,
+            open_entry_url,
             focus_main,
         ])
         .run(tauri::generate_context!())
