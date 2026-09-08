@@ -31,7 +31,7 @@ pub struct VsmItem {
     pub freq: i64,
 }
 
-fn strip_html(s: &str) -> String {
+pub fn strip_html(s: &str) -> String {
     // 简易去标签：去掉 <...>，解码常见实体
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;

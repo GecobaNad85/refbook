@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Position, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Code, Modifiers, Shortcut, ShortcutState};
 
@@ -15,6 +15,17 @@ struct AppState {
     float: Mutex<Option<WebviewWindow>>,
     /// 托盘"显示悬浮图标"开关：false 时即使主窗口关闭也不显示悬浮图标
     float_enabled: Mutex<bool>,
+    /// 启动预检的 CNKI 登录态缓存：None = 尚未预检
+    ///（预检由 setup 里后台任务完成，前端"查看全文"读这里，不再现建/现显窗口）
+    login_cached: Mutex<Option<LoginCache>>,
+}
+
+/// 启动预检得到的登录态快照
+#[derive(Clone)]
+struct LoginCache {
+    logged_in: bool,
+    error: String,
+    checked_at: std::time::Instant,
 }
 
 #[tauri::command]
@@ -492,50 +503,98 @@ fn focus_main(app: tauri::AppHandle) {
     show_main(&app);
 }
 
-/// CNKI 登录/鉴权窗口的注入脚本：监听 Rust 下发的查询请求，在 gongjushu.cnki.net
-/// 页面上下文内带 cookie fetch t.cnki.net entry/detail API（等价于扩展 content.js 的
-/// callEntryApiWithCookie）。结果写入 window.__cnkiResult，由 Rust 侧 eval 读取
-/// （External URL 页面不注入 __TAURI__ 全局，不能用 emit 回传）。
+/// CNKI 登录/鉴权 webview 的初始化脚本（document-start，对所有加载页面执行）：
+/// 处理 #cnki_redirect 中转：从 gongjushu 域内 location.href 跳 bar.cnki.net
+/// CNKI 登录/鉴权 webview 的初始化脚本（document-start，对所有加载页面执行）：
+/// 1. 处理 #cnki_redirect 中转：从 gongjushu 域内 location.href 跳 bar.cnki.net
+///    （Referer 校验通过），bar.cnki.net 随后 302 到带 invoice/nonce 的详情 URL；
+/// 2. 登录模式（URL 带 tb_login=1）：自动点击右上角"登录"按钮，展开登录层
+///    （gongjushu 登录为同域 iframe Ecp_top_login_realNa，登录 cookie 直接落在
+///    gongjushu.cnki.net 域）。
+/// 全文获取由 cnki_detail_auth 用 eval_with_callback 轮询 p.image_box，不经页面回传。
 const CNKI_AUTH_INIT_SCRIPT: &str = r#"
 (function () {
-  window.__cnkiResult = null; // { reqId, ok, content, error }
-  window.__cnkiDetail = async function (req) {
-    var SCOPES = ['content', 'preview', 'download'];
-    async function tryScope(scope) {
-      var body = {
-        filename: req.fn_, tablename: req.tablename || 'CRFD2025',
-        product: req.product || 'CRFD', platform: 'NRBOOK', type: 'REFBOOK',
-        scope: scope, cflag: 'overlay', dflag: '词条', language: 'CHS',
-        pages: '', sid: '', idenid: ''
-      };
-      var r = await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json;charset=utf-8', language: 'CHS',
-                   Origin: 'https://gongjushu.cnki.net', Referer: 'https://gongjushu.cnki.net/' },
-        credentials: 'include',
-        body: JSON.stringify(body)
-      });
-      var j = await r.json();
-      if (j.code !== 0) throw new Error(j.message || ('code ' + j.code));
-      var c = (j.data && j.data.data && j.data.data[0] && j.data.data[0].content) || '';
-      c = c.replace(/<[^>]*>/g, '').trim();
-      if (!c) throw new Error('条目内容为空');
-      return c;
+  try {
+    if (window.location.hostname.endsWith('.cnki.net')) {
+      var m = window.location.hash && window.location.hash.match(/#cnki_redirect=(.+)/);
+      if (m) {
+        var t = decodeURIComponent(m[1]);
+        try {
+          var u = new URL(t);
+          if (u.protocol !== 'https:' || (!u.hostname.endsWith('.cnki.net') && u.hostname !== 'cnki.net')) return;
+        } catch (_) { return; }
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        location.href = t;
+        return;
+      }
     }
-    try {
-      var content = await Promise.any(SCOPES.map(tryScope));
-      return { ok: true, content: content };
-    } catch (e) {
-      var msg = (e && e.errors && e.errors[0] && e.errors[0].message) || (e && e.message) || '获取失败';
-      if (/未登录|登录|403|验证参数/.test(msg)) msg = '未登录或登录已过期，请在托盘菜单点击\"CNKI 登录…\"重新登录';
-      return { ok: false, content: '', error: msg };
+  } catch (_) {}
+
+  // 登录模式：把页面收成"仅登录"小窗。
+  // gongjushu 未登录时页面右上角只有一个"登录"文字，登录表单（.login_box_main_container，
+  // 含用户名/密码/验证码/登录按钮）是页面内 DOM，点"登录"后展开。此处：
+  // 1. 点右上角"登录"文字，触发登录层渲染/展开；
+  // 2. 等 .login_box_main_container（含 Ecp_TextBoxUserName）出现后，
+  //    把它从原浮层中剪切出来挂到 body 顶层、全窗居中显示；
+  // 3. 隐藏 body 下其余所有顶层区块，只留登录表单。
+  // 已登录态（页面无"登录"文字）则跳过，保持普通页面。
+  try {
+    var loginMode = new URLSearchParams(window.location.search).get('tb_login');
+    if (loginMode) {
+      var tries = 0;
+      var timer = setInterval(function () {
+        if (++tries > 100) { clearInterval(timer); return; } // ~20s 后放弃
+        // 找可点的"登录"文字（未登录标志）
+        var loginTab = null;
+        var btns = document.querySelectorAll('a.ecp_tn-tab');
+        for (var i = 0; i < btns.length; i++) {
+          if ((btns[i].textContent || '').trim() === '登录') { loginTab = btns[i]; break; }
+        }
+        if (!loginTab) {
+          // 已登录或无登录入口：结束登录模式
+          clearInterval(timer);
+          try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+          return;
+        }
+        try { if (!loginTab.dataset.tbClicked) { loginTab.dataset.tbClicked = '1'; loginTab.click(); } } catch (_) {}
+        // 等登录表单渲染完成（用户名输入框存在且容器有尺寸）
+        var box = document.querySelector('.login_box_main_container');
+        var input = document.getElementById('Ecp_TextBoxUserName');
+        if (!box || !input) return;
+        try {
+          clearInterval(timer);
+          // 剪切登录表单到 body 顶层（保留元素自身的事件绑定）
+          document.body.appendChild(box);
+          box.style.cssText = [
+            'display:block !important',
+            'position:fixed !important',
+            'top:0 !important',
+            'left:0 !important',
+            'width:100% !important',
+            'height:100% !important',
+            'margin:0 !important',
+            'padding:26px 28px !important',
+            'box-sizing:border-box !important',
+            'background:#fff !important',
+            'z-index:999999 !important',
+            'overflow:auto !important',
+          ].join(';');
+          // 隐藏页面其余所有顶层区块
+          Array.prototype.forEach.call(document.body.children, function (el) {
+            if (el.tagName === 'SCRIPT' || el.tagName === 'NOSCRIPT') return;
+            if (el === box) return;
+            el.style.display = 'none';
+          });
+          try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+        } catch (_) {}
+      }, 200);
     }
-  };
+  } catch (_) {}
 })();
 "#;
 
-/// 获取（或创建）CNKI 鉴权 webview：加载 gongjushu.cnki.net，带 cookie 罐，
-/// 注入 __cnkiDetail 用于带 cookie 调用 entry/detail API
+/// 获取（或创建）CNKI 鉴权 webview：加载 gongjushu.cnki.net，带持久化 cookie 罐。
+/// 注入初始化脚本：#cnki_redirect 中转 + 登录模式自动展开登录层。
 fn get_or_create_cnki_auth(app: &AppHandle) -> Option<WebviewWindow> {
     if let Some(w) = app.get_webview_window("cnki-auth") {
         return Some(w);
@@ -544,31 +603,222 @@ fn get_or_create_cnki_auth(app: &AppHandle) -> Option<WebviewWindow> {
     let w = WebviewWindowBuilder::new(app, "cnki-auth", WebviewUrl::External(url))
         .title("CNKI 登录 · 工具书查词")
         .inner_size(1024.0, 720.0)
+        // 创建时隐藏：仅"查看全文"/"CNKI 登录"时才显示。
+        // 否则前端查登录状态（cnki_login_status）首次创建窗口时会瞬间弹出，
+        // 造成"查词却弹出登录窗口"的打扰。
+        .visible(false)
         .initialization_script(CNKI_AUTH_INIT_SCRIPT)
         .build()
         .ok()?;
+    // 登录窗口"关闭"→ 隐藏而非销毁：cnki_detail_auth 复用该窗口内已登录的
+    // cookie 会话完成跳转取凭证。一旦销毁，即使已登录也拿不到 invoice/nonce。
+    let wc = w.clone();
+    w.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = wc.hide();
+        }
+    });
     Some(w)
 }
 
-/// 打开 CNKI 登录窗口（用户在此登录后，cookie 持久化到 webview cookie 罐，
-/// 之后"查看全文"经该窗口上下文带 cookie 调用 API）
-#[tauri::command]
-fn open_cnki_login(app: tauri::AppHandle) {
-    if let Some(w) = get_or_create_cnki_auth(&app) {
-        let _ = w.show();
-        let _ = w.set_focus();
-        // 已存在时导航回首页，方便重新登录
-        let _ = w.eval("window.location.href = 'https://gongjushu.cnki.net/';");
+/// 实时检查 CNKI 登录态：创建（或复用）隐藏的 cnki-auth 窗口，读 gongjushu 域 cookie。
+/// 返回 { loggedIn, cookies, error }。
+/// 注意：本函数创建窗口时必须保持隐藏（WebviewWindowBuilder .visible(false)），
+/// 否则首次调用会瞬间弹出窗口，造成"查词却弹出登录窗口"的打扰。
+///
+/// 过期判断：gongjushu 会话 cookie `c_m_expire` 的值是 URL 编码的
+/// `YYYY-MM-DD HH:MM:SS`（如 `2026-10-08%2008%3A15%3A06`），表示服务端会话过期时间。
+/// 仅凭 cookie 存在判断登录态会把"已过期"误判为"已登录"，因此把过期时间与当前时间比较：
+/// 会话 cookie 存在但已过期 → 视为未登录。
+fn check_cnki_login_live(app: &AppHandle) -> serde_json::Value {
+    let w = match get_or_create_cnki_auth(app) {
+        Some(w) => w,
+        None => {
+            return serde_json::json!({
+                "loggedIn": false,
+                "error": "无法创建 CNKI 登录窗口，请稍后重试",
+            });
+        }
+    };
+    let url: tauri::Url = match "https://gongjushu.cnki.net/".parse() {
+        Ok(u) => u,
+        Err(_) => return serde_json::json!({ "loggedIn": false, "error": "URL 解析失败" }),
+    };
+    match w.cookies_for_url(url) {
+        Ok(cookies) => {
+            // 日志带 value（截断），用于观察 c_m_expire 等是否携带过期时间信息
+            let pairs: Vec<String> = cookies
+                .iter()
+                .map(|c| {
+                    let v = c.value();
+                    let v = if v.len() > 48 { &v[..48] } else { v };
+                    format!("{}={}", c.name(), v)
+                })
+                .collect();
+            let session_cookie = cookies.iter().any(|c| {
+                matches!(c.name(), "Ecp_session" | "Ecp_LoginStuts" | "c_m_LinID")
+            });
+            // 会话 cookie 存在，但 c_m_expire（服务端过期时间）已过期 → 视为未登录
+            let expired = session_cookie && cookies.iter().any(|c| {
+                c.name() == "c_m_expire" && cookie_expired(c.value())
+            });
+            let logged_in = session_cookie && !expired;
+            eprintln!(
+                "[cnki_login_status] gongjushu cookies: {pairs:?} -> session={session_cookie}, expired={expired}, logged_in={logged_in}"
+            );
+            serde_json::json!({ "loggedIn": logged_in, "cookies": pairs, "error": "" })
+        }
+        Err(e) => {
+            eprintln!("[cnki_login_status] cookies_for_url error: {e}");
+            serde_json::json!({
+                "loggedIn": false,
+                "cookies": [],
+                "error": format!("读取登录状态失败: {e}"),
+            })
+        }
     }
 }
 
-/// 带 cookie 查询条目全文：在 cnki-auth webview 内执行 fetch（带 cookie），结果通过
-/// document.title 分块回传（External URL 页面无 __TAURI__ 全局，eval_with_callback 在
-/// 跨域页面上回调不可靠；title() 可同步读取 JS 设置的 document.title，但实测 WebKitGTK
-/// 把 document.title 截断到 1000 字符，单块放不下完整结果，故切成小块依次写入、
-/// Rust 侧轮询累积，最后以 "DONE:<n>" 收尾）。前端"查看全文"调用此命令替代裸 reqwest 的 cnki_detail。
+/// 判断 gongjushu 会话是否过期：c_m_expire 的值是 URL 编码的 `YYYY-MM-DD HH:MM:SS`，
+/// 解码后与当前时间比较。无法解析时视为未过期（宁可放行，由取全文超时兜底）。
+fn cookie_expired(value: &str) -> bool {
+    use time::macros::format_description;
+    let decoded = url_decode(value);
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    let Ok(exp) = time::PrimitiveDateTime::parse(&decoded, &fmt) else {
+        return false;
+    };
+    // 当前时间取本地（与 CNKI 的过期时间为同一时区语义；解析失败则放行）
+    let now = match time::OffsetDateTime::now_local() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let now_naive = time::PrimitiveDateTime::new(now.date(), now.time());
+    now_naive > exp
+}
+
+/// 极简 URL 解码（仅处理 %XX 十六进制），用于解码 c_m_expire 的值
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &s[i + 1..i + 3];
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 前端"查看全文"调用的登录状态命令：优先返回启动预检的缓存（新鲜度 60s），
+/// 缓存缺失/过期时才实时检查。实时检查的窗口创建保持隐藏，不打扰用户。
 #[tauri::command]
-async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String, product: String) -> cnki::DetailResponse {
+fn cnki_login_status(app: tauri::AppHandle) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let cached = state.login_cached.lock().unwrap().clone();
+    if let Some(c) = cached {
+        if c.checked_at.elapsed() < std::time::Duration::from_secs(60) {
+            return serde_json::json!({ "loggedIn": c.logged_in, "cookies": [], "error": c.error });
+        }
+    }
+    let live = check_cnki_login_live(&app);
+    // 回填缓存，供后续调用复用
+    if let (Some(li), Some(err)) = (
+        live.get("loggedIn").and_then(|v| v.as_bool()),
+        live.get("error").and_then(|v| v.as_str()),
+    ) {
+        let mut guard = state.login_cached.lock().unwrap();
+        *guard = Some(LoginCache {
+            logged_in: li,
+            error: err.to_string(),
+            checked_at: std::time::Instant::now(),
+        });
+    }
+    live
+}
+
+/// 收成"仅登录"小窗——点右上角"登录"触发登录层，再把 .login_box_main_container
+/// （用户名/密码/验证码/登录按钮）提取成全窗居中显示，隐藏页面其余内容。
+/// 登录在 gongjushu 同域 iframe 内完成，cookie 直接落在 gongjushu.cnki.net 域，
+/// 与"查看全文"会话共享。
+#[tauri::command]
+fn open_cnki_login(app: tauri::AppHandle) {
+    if let Some(w) = get_or_create_cnki_auth(&app) {
+        // 仅登录小窗：登录表单自然宽约 360px、高约 400px，窗口略大留出边距
+        let _ = w.set_size(LogicalSize::new(460.0, 500.0));
+        let _ = w.set_resizable(true);
+        let _ = w.navigate("https://gongjushu.cnki.net/rbook/?tb_login=1".parse().unwrap());
+        let _ = w.show();
+        let _ = w.set_focus();
+        // 登录成功监控：后台轮询 gongjushu 会话 cookie，一旦已登录且登录窗口
+        // 正在前台显示（非最小化隐身——那是"查看全文"场景），就自动隐藏登录窗口。
+        // 否则 gongjushu 表单被注入脚本提取后，登录成功的界面更新（顶部用户菜单）
+        // 被隐藏看不到，用户会以为登录卡住；窗口自动关闭后流程清晰。
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            let url: tauri::Url = match "https://gongjushu.cnki.net/".parse() {
+                Ok(u) => u,
+                Err(_) => return,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                // 登录窗口已被用户关闭 → 结束监控
+                if !w2.is_visible().unwrap_or(false) {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                let logged = w2
+                    .cookies_for_url(url.clone())
+                    .map(|cs| cs.iter().any(|c| matches!(c.name(), "Ecp_LoginStuts" | "c_m_LinID")))
+                    .unwrap_or(false);
+                if logged && !w2.is_minimized().unwrap_or(true) {
+                    eprintln!("[login-monitor] logged in, hiding login window");
+                    let _ = w2.hide();
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// 查询条目全文（桌面版主路径）：在 cnki-auth webview 内导航到条目的跳转链接
+/// （readonline_url，bar.cnki.net），登录态会话经 #cnki_redirect 中转后，bar.cnki.net
+/// 查询条目全文（桌面版主路径）：在 cnki-auth webview 内导航到条目的跳转链接
+/// （readonline_url，bar.cnki.net），登录态会话经 #cnki_redirect 中转后，bar.cnki.net
+/// 302 到带 invoice/nonce 的 gongjushu 详情 URL，SPA 将全文渲染到 p.image_box。
+/// Rust 侧用 eval_with_callback 轮询读取该元素文本（eval 回调是 wry 原生 JS 求值
+/// 通道，不依赖 __TAURI_INTERNALS__；窗口显示时页面 JS 正常执行）。
+///
+/// 这条路复刻浏览器扩展 content.js 的已验证路径——登录态页面直接渲染释文，
+/// 不经过 t.cnki.net entry/detail API（该 API 即使带 invoice/nonce 也返回系统异常）。
+///
+/// async 命令（轮询用 async sleep，不阻塞 UI）。
+#[tauri::command]
+async fn cnki_detail_auth(
+    app: tauri::AppHandle,
+    fn_: String,
+    tablename: String,
+    product: String,
+    readonline_url: String,
+) -> cnki::DetailResponse {
+    let _ = (&tablename, &product); // 保留参数兼容前端
     let w = match app.get_webview_window("cnki-auth") {
         Some(w) => w,
         None => return cnki::DetailResponse {
@@ -576,106 +826,151 @@ async fn cnki_detail_auth(app: tauri::AppHandle, fn_: String, tablename: String,
             error: "未登录 CNKI，请先在托盘菜单点击\"CNKI 登录…\"".into(),
         },
     };
-    // 用唯一标记避免读到旧 title。fetch 逻辑内联，不依赖 init script 注入时机。
-    // 标题上限 1000 字符：标记(~30) + "P:<idx>:"(~8) + 块(900) 留有余量。
-    // 块按 150ms 间隔依次写入（Rust 侧 40ms 轮询，确保每块至少被读到 3 次）。
-    let marker = format!("__CNKI_RES__{}__", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    let js = format!(
-        r#"(async () => {{
-  var SCOPES = ['content','preview','download'];
-  async function tryScope(scope){{
-    var body={{filename:{fn_},tablename:{tn}||'CRFD2025',product:{pd}||'CRFD',
-      platform:'NRBOOK',type:'REFBOOK',scope:scope,cflag:'overlay',dflag:'词条',
-      language:'CHS',pages:'',sid:'',idenid:''}};
-    var r=await fetch('https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK',
-      {{method:'POST',headers:{{'Content-Type':'application/json;charset=utf-8',language:'CHS'}},
-       credentials:'include',body:JSON.stringify(body)}});
-    var j=await r.json();
-    if(j.code!==0) throw new Error(j.message||('code '+j.code));
-    var c=(j.data&&j.data.data&&j.data.data[0]&&j.data.data[0].content)||'';
-    c=c.replace(/<[^>]*>/g,'').trim();
-    if(!c) throw new Error('条目内容为空');
-    return c;
-  }}
-  var res;
-  try {{
-    var content=await Promise.any(SCOPES.map(tryScope));
-    res={{ok:true,content:content}};
-  }} catch(e){{
-    var msg=(e&&e.errors&&e.errors[0]&&e.errors[0].message)||(e&&e.message)||'获取失败';
-    if(/未登录|登录|403|验证参数/.test(msg)) msg='未登录或登录已过期，请在托盘菜单点击\"CNKI 登录…\"重新登录';
-    res={{ok:false,content:'',error:msg}};
-  }}
-  var M={mk};
-  var payload=JSON.stringify(res);
-  var CS=900;
-  var n=Math.max(1,Math.ceil(payload.length/CS));
-  var i=0;
-  (function w(){{
-    if(i>=n){{ document.title=M+'DONE:'+n; return; }}
-    document.title=M+'P:'+i+':'+payload.slice(i*CS,(i+1)*CS);
-    i++;
-    setTimeout(w,150);
-  }})();
-}})();"#,
-        fn_ = serde_json::to_string(&fn_).unwrap_or_else(|_| "\"\"".into()),
-        tn = serde_json::to_string(&tablename).unwrap_or_else(|_| "\"\"".into()),
-        pd = serde_json::to_string(&product).unwrap_or_else(|_| "\"\"".into()),
-        mk = serde_json::to_string(&marker).unwrap_or_else(|_| "\"\"".into()),
-    );
-    if let Err(e) = w.eval(&js) {
+    // 无 readonline_url 时无法触发 bar.cnki.net 跳转，也就进不了渲染释文的详情页
+    if readonline_url.is_empty() {
         return cnki::DetailResponse {
             ok: false, content: String::new(),
-            error: format!("调用鉴权窗口失败: {e}"),
+            error: "该条目没有跳转链接，无法获取全文".into(),
         };
     }
-    // 轮询 document.title（同步 title()）累积分块，读到 "DONE:<n>" 后拼接解析
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut chunks: Vec<String> = Vec::new();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        if std::time::Instant::now() > deadline {
-            return cnki::DetailResponse {
-                ok: false, content: String::new(),
-                error: "查询超时，若未登录请在托盘菜单点击\"CNKI 登录…\"".into(),
-            };
-        }
-        let title = match w.title() {
-            Ok(t) => t,
-            Err(_) => continue,
+    // 经 gongjushu detail 中转（#cnki_redirect）：页面初始化脚本校验后跳到
+    // bar.cnki.net，其 Referer 校验自然通过；bar.cnki.net 再 302 到带凭证的详情 URL。
+    let nav_url = format!(
+        "https://gongjushu.cnki.net/rbook/detail?Fn={}#cnki_redirect={}",
+        urlencode(&fn_),
+        urlencode(&readonline_url),
+    );
+    let url: tauri::Url = match nav_url.parse() {
+        Ok(u) => u,
+        Err(e) => return cnki::DetailResponse {
+            ok: false, content: String::new(),
+            error: format!("构造链接失败: {e}"),
+        },
+    };
+    // WebKitGTK 对隐藏 webview 的页面渲染/JS 执行会冻结，导航前必须保证窗口"可见"
+    //（对 GTK 而言 mapped 即可见）。但用户不希望取全文时弹窗打扰 → 用"最小化隐身"：
+    // show + minimize + 不入任务栏 + 不可聚焦。窗口仍映射着（JS 照常执行），但用户
+    // 在任务栏/alt-tab/焦点上都看不到它。若最小化在个别平台导致 JS 冻结（X11 上
+    // 最小化常等价于 unmap），则超时兜底恢复可见继续取——功能不丢，只是退化为现弹窗。
+    let was_hidden = !w.is_visible().unwrap_or(false);
+    let mut stealth = false;
+    if was_hidden {
+        let _ = w.show();
+        let _ = w.set_skip_taskbar(true);
+        let _ = w.set_focusable(false);
+        let _ = w.minimize();
+        stealth = true;
+    }
+    // 窗口标题改为"条目详情"，避免沿用"CNKI 登录 · 工具书查词"造成误导
+    let _ = w.set_title("条目详情 · 工具书查词");
+    // 登录时窗口被缩小为登录小窗，看全文时恢复为可展示条目页的尺寸
+    let _ = w.set_size(LogicalSize::new(960.0, 720.0));
+    if let Err(e) = w.navigate(url) {
+        if was_hidden { let _ = w.hide(); }
+        return cnki::DetailResponse {
+            ok: false, content: String::new(),
+            error: format!("导航到条目页失败: {e}"),
         };
-        let Some(body) = title.strip_prefix(&marker) else { continue };
-        if let Some(count_str) = body.strip_prefix("DONE:") {
-            let count: usize = count_str.trim().parse().unwrap_or(0);
-            if chunks.len() >= count && chunks.iter().all(|c| !c.is_empty()) {
-                // 全部块已收到，恢复 title（去掉脏数据）
-                let _ = w.set_title("CNKI 登录 · 工具书查词");
-                let payload = chunks.concat();
-                let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&payload) {
-                    Ok(v) => v,
-                    Err(e) => return cnki::DetailResponse {
-                        ok: false, content: String::new(),
-                        error: format!("解析鉴权结果失败: {e}"),
-                    },
-                };
-                let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-                let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                return cnki::DetailResponse { ok, content, error };
-            }
+    }
+    eprintln!("[cnki_detail_auth] navigate ok, fn={fn_}, stealth={stealth}, polling p.image_box...");
+    // 轮询 eval_with_callback 读取 p.image_box 释文（SPA 渲染 + 跳转，最长 ~25s）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    // 隐身模式下 8s 无结果 → 视为最小化冻结了 JS，恢复可见继续取（保证功能）
+    let stealth_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut silent_polls = 0u32;
+    // 结束时恢复窗口状态：还原任务栏/焦点属性，取消最小化，若原本隐藏则藏回
+    let restore = |w: &WebviewWindow| {
+        let _ = w.set_skip_taskbar(false);
+        let _ = w.set_focusable(true);
+        let _ = w.unminimize();
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if stealth && std::time::Instant::now() > stealth_deadline {
+            stealth = false;
+            restore(&w);
+            eprintln!("[cnki_detail_auth] stealth 8s no result, restored visible to continue");
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tx2 = tx.clone();
+        if w
+            .eval_with_callback(CNKI_EVAL_EXTRACT, move |res| {
+                let _ = tx2.send(res);
+            })
+            .is_err()
+        {
             continue;
         }
-        if let Some(rest) = body.strip_prefix("P:") {
-            if let Some(colon) = rest.find(':') {
-                if let Ok(idx) = rest[..colon].parse::<usize>() {
-                    let chunk = rest[colon + 1..].to_string();
-                    if chunks.len() <= idx { chunks.resize(idx + 1, String::new()); }
-                    chunks[idx] = chunk;
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(raw) => {
+                silent_polls = 0;
+                // eval_with_callback 回调收到的是 JS 求值结果的 JSON 序列化字符串
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(s) = v.as_str() {
+                        let text = s.trim().to_string();
+                        // 仅当读到实际释文（非空/非占位符）才返回
+                        if text.len() > 10 {
+                            if was_hidden {
+                                restore(&w);
+                                let _ = w.hide();
+                            }
+                            eprintln!("[cnki_detail_auth] FOUND full text, {} chars", text.len());
+                            return cnki::DetailResponse { ok: true, content: text, error: String::new() };
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // 回调未触发：页面可能还在跳转/渲染，或 eval 通道不可用
+                silent_polls += 1;
+                if silent_polls % 8 == 0 {
+                    eprintln!("[cnki_detail_auth] {} silent polls (eval no callback yet)", silent_polls);
                 }
             }
         }
+        if std::time::Instant::now() > deadline {
+            let url_now = w.url().map(|u| u.to_string()).unwrap_or_default();
+            if was_hidden {
+                restore(&w);
+                let _ = w.hide();
+            }
+            eprintln!("[cnki_detail_auth] TIMEOUT, silent_polls={silent_polls}, url={url_now}");
+            return cnki::DetailResponse {
+                ok: false, content: String::new(),
+                error: format!(
+                    "获取全文超时（页面可能未渲染或未登录）。url={}",
+                    url_now
+                ),
+            };
+        }
     }
+}
+
+/// 读取当前页面 p.image_box 的释文；未渲染时返回空字符串
+///（eval_with_callback 把 JS 求值结果 JSON 序列化后回调给 Rust）
+const CNKI_EVAL_EXTRACT: &str = r#"(function () {
+  try {
+    var box = document.querySelector('p.image_box');
+    if (box) {
+      var t = (box.textContent || '').trim();
+      if (t) return t;
+    }
+  } catch (_) {}
+  return '';
+})()"#;
+
+fn urlencode(s: &str) -> String {
+    // 极简 URL 编码：仅编码需要编码的字符（用于 Fn / readonline_url 放进 URL）
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -687,8 +982,40 @@ pub fn run() {
             popup: Mutex::new(None),
             float: Mutex::new(None),
             float_enabled: Mutex::new(true),
+            login_cached: Mutex::new(None),
         })
         .setup(|app| {
+            // 启动即后台预检 CNKI 登录态：创建隐藏的 cnki-auth 窗口并读 cookie，
+            // 结果缓存到 AppState，供前端"查看全文"读取，避免首次点击时现建/现显窗口。
+            // 注意：必须在 setup 返回之后（事件循环已跑起来）再做，否则窗口无法创建。
+            {
+                let app_handle = app.handle().clone();
+                // 用普通线程延迟 + run_on_main_thread 回主线程做检查（GTK 窗口操作须在主线程）
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let app_handle2 = app_handle.clone();
+                    let _ = app_handle.run_on_main_thread(move || {
+                        let v = check_cnki_login_live(&app_handle2);
+                        if let (Some(li), Some(err)) = (
+                            v.get("loggedIn").and_then(|x| x.as_bool()),
+                            v.get("error").and_then(|x| x.as_str()),
+                        ) {
+                            let state = app_handle2.state::<AppState>();
+                            let mut guard = state.login_cached.lock().unwrap();
+                            *guard = Some(LoginCache {
+                                logged_in: li,
+                                error: err.to_string(),
+                                checked_at: std::time::Instant::now(),
+                            });
+                            eprintln!(
+                                "[startup] cnki login precheck -> logged_in={}, cached",
+                                li
+                            );
+                        }
+                    });
+                });
+            }
+
             // 全局快捷键 Ctrl+Alt+D（避免与浏览器 Ctrl+Shift+D 书签管理冲突）
             let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyD);
             let app_handle = app.handle().clone();
@@ -735,6 +1062,7 @@ pub fn run() {
             popup_open_external,
             open_entry_url,
             open_cnki_login,
+            cnki_login_status,
             cnki_detail_auth,
             focus_main,
         ])

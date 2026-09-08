@@ -27,6 +27,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 arboard = "3"
 scraper = "0.22"
+time = { version = "0.3", features = ["parsing", "local-offset", "macros"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-clipboard = "0.9"

@@ -435,20 +435,27 @@ function initMain() {
     tab.fetchError = '加载中…';
     render();
     try {
-      // 优先走带 cookie 的鉴权路径（需 CNKI 登录）；失败回退裸 API
-      // 注意：Tauri 将 Rust 参数名 fn_ 重命名为 fn，invoke 须传 fn
-      let d = await invoke('cnki_detail_auth', { fn: item.fn, tablename: item.tablename, product: item.product });
-      const authErr = d.ok ? '' : (d.error || '');
-      if (!d.ok) {
-        try {
-          d = await invoke('cnki_detail', { fn: item.fn, tablename: item.tablename, product: item.product });
-        } catch (_) {}
-        // 裸 API 无 cookie 必然拿不到全文；若鉴权路径已给出登录指引，优先展示它
-        // （裸 API 返回的"验证参数为空"等隐晦报错会掩盖未登录这个真实原因）
-        if (!d.ok && authErr && /登录|鉴权/.test(authErr)) {
-          d = { ok: false, content: '', error: authErr };
-        }
+      // 先检查登录态：已登录静默走详情页流程；未登录只提示去登录，
+      // 不再出现"点查看全文就触发登录、点了又显示已登录"的矛盾。
+      const st = await invoke('cnki_login_status');
+      if (gen !== generation) return;
+      if (!st.loggedIn) {
+        tab.fullText = '';
+        tab.fetchError = st.error || '未登录 CNKI，请先在托盘菜单点击"CNKI 登录…"';
+        render();
+        return;
       }
+      // 唯一主路径：在 cnki-auth webview 里导航到条目的跳转链接，
+      // 页面渲染出 p.image_box 释文后由 Rust 侧 eval 轮询取回。
+      // 注意：Tauri 将 Rust 参数名 fn_ 重命名为 fn，invoke 须传 fn。
+      // 不再回退裸 entry/detail API——实测它即使带 invoice/nonce 也返回
+      // "系统异常"，只会给出误导性报错。
+      const d = await invoke('cnki_detail_auth', {
+        fn: item.fn,
+        tablename: item.tablename,
+        product: item.product,
+        readonlineUrl: item.readonlineUrl || '',
+      });
       if (gen !== generation) return;
       tab.fullText = d.ok ? d.content : '';
       tab.fetchError = d.ok ? '' : (d.error || '获取释文失败');
