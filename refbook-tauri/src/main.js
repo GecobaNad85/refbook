@@ -118,6 +118,121 @@ function slidingWindowSegment(text) {
   return segments;
 }
 
+// 预切分用的标点集合（中英文标点）。模块级常量，避免每次调用重新分配。
+const PRE_SPLIT_PUNCT = new Set([
+  '，', '。', '、', '：', '；', '·', '・', '•', '─', '—',
+  ',', '.', ':', ';', '·', '・', '•', '－', '-',
+  '（', '）', '(', ')', '《', '》', '〈', '〉',
+  '「', '」', '『', '』', '"', '"', "'", "'", '"', "'",
+  '？', '！', '?', '!', '…', '～', '~',
+  '【', '】', '[', ']', '｛', '｝', '{', '}',
+  '　', ' ', '\t', '\n', '\r', '/', '\\', '|',
+]);
+const PRE_SPLIT_MAX_SEGS = 12; // 与 slidingWindowSegment 一致，限制并发查询数
+
+// 判断字符是否为中文（CJK 统一汉字 + 扩展A + 兼容汉字 + 扩展B+）
+function isChineseChar(ch) {
+  const code = ch.codePointAt(0);
+  return (code >= 0x4E00 && code <= 0x9FFF)    // CJK 统一汉字
+      || (code >= 0x3400 && code <= 0x4DBF)    // CJK 扩展A
+      || (code >= 0xF900 && code <= 0xFAFF)    // CJK 兼容汉字
+      || (code >= 0x20000 && code <= 0x2FA1F); // CJK 扩展B+ 及兼容补充
+}
+// 判断是否为拉丁字母/数字（含全角拉丁字母与全角数字）
+function isLatinChar(ch) {
+  const code = ch.codePointAt(0);
+  return (code >= 0x41 && code <= 0x5A)       // A-Z
+      || (code >= 0x61 && code <= 0x7A)       // a-z
+      || (code >= 0x30 && code <= 0x39)       // 0-9
+      || (code >= 0xFF21 && code <= 0xFF3A)   // Ａ-Ｚ 全角
+      || (code >= 0xFF41 && code <= 0xFF5A)   // ａ-ｚ 全角
+      || (code >= 0xFF10 && code <= 0xFF19);  // ０-９ 全角
+}
+
+// 预切分：在 SegmentIt 分词之前，先按标点和中英文边界拆分。
+// 适用于用户划选了带标点的短语（如"人之初，性本善"）或中英混合词（如"AI人工智能"）。
+// 返回 [{text, start, end, len}]，不适用（与原词无差异）时返回 null。
+function preSplitText(text) {
+  const chars = Array.from(text);
+  const len = chars.length;
+  if (len < 2) return null;
+
+  // 第一步：按标点切分成段
+  const punctSegments = [];
+  let segStart = 0;
+  for (let i = 0; i < len; i++) {
+    if (PRE_SPLIT_PUNCT.has(chars[i])) {
+      if (i > segStart) {
+        punctSegments.push({ start: segStart, end: i });
+      }
+      segStart = i + 1;
+    }
+  }
+  if (len > segStart) {
+    punctSegments.push({ start: segStart, end: len });
+  }
+
+  // 第二步：对每段做中英文分离
+  // 逐字符扫描，语言类型变化时断开（中文段、英文段交替）
+  const segments = [];
+  for (const seg of punctSegments) {
+    let langStart = seg.start;
+    let currentType = null; // 'zh' | 'latin' | 'other'
+    for (let i = seg.start; i < seg.end; i++) {
+      const ch = chars[i];
+      const type = isChineseChar(ch) ? 'zh' : (isLatinChar(ch) ? 'latin' : 'other');
+      if (currentType === null) {
+        currentType = type;
+      } else if (type !== currentType && type !== 'other' && currentType !== 'other') {
+        // 语言边界：中文↔英文切换，断开
+        if (i > langStart) {
+          segments.push({ start: langStart, end: i });
+        }
+        langStart = i;
+        currentType = type;
+      } else if (type === 'other') {
+        // other 字符不改变当前语言段，但也不断开（附属于当前段）
+        // 若 currentType 也是 other（连续 other），保持
+      } else if (currentType === 'other') {
+        // 从 other 进入中文/英文
+        if (i > langStart) {
+          segments.push({ start: langStart, end: i });
+        }
+        langStart = i;
+        currentType = type;
+      }
+    }
+    if (seg.end > langStart) {
+      segments.push({ start: langStart, end: seg.end });
+    }
+  }
+
+  // 过滤太短的段（单字符）并构造结果，限制最大段数以约束并发查询
+  const result = [];
+  for (const seg of segments) {
+    const segText = chars.slice(seg.start, seg.end).join('');
+    const segLen = seg.end - seg.start;
+    if (segLen >= 2) {
+      result.push({ text: segText, start: seg.start, end: seg.end, len: segLen });
+      if (result.length >= PRE_SPLIT_MAX_SEGS) break;
+    }
+  }
+
+  if (result.length === 0) return null;
+  // 若唯一结果就是原词本身（未发生标点剥离或语言切分），预切分无增益——交给 SegmentIt。
+  // 注意：带首尾标点（如"人工智能。"）或单侧被长度过滤的中英混合（如"AI啊"）在此都会
+  // 产生与原词不同的结果文本，从而不被跳过。
+  if (result.length === 1 && result[0].text === text) return null;
+
+  // 去重
+  const seen = new Set();
+  return result.filter(s => {
+    if (seen.has(s.text)) return false;
+    seen.add(s.text);
+    return true;
+  });
+}
+
 // SegmentIt 智能分词（带 POS 过滤），返回 [{text,start,end,len}]；失败返回 null
 async function segmentWithSegmentIt(text) {
   const Segmentit = await waitForSegmentit();
@@ -177,6 +292,17 @@ function selectNonOverlapping(segmentsWithResults, textLen) {
   }
   selected.sort((a, b) => a.seg.start - b.seg.start);
   return selected;
+}
+
+// 并行查询一批词段，返回 [{seg, results}]（失败或无结果时 results 为 []）
+async function querySegments(segs) {
+  return Promise.all(
+    segs.map((seg) =>
+      invoke('cnki_search', { word: seg.text, size: 5 })
+        .then((r) => ({ seg, results: r && r.ok ? (r.results || []) : [] }))
+        .catch(() => ({ seg, results: [] }))
+    )
+  );
 }
 
 async function toSimplified(text) {
@@ -365,19 +491,22 @@ function initMain() {
       return true;
     }
 
-    // 整词未命中 → 分词并行查询
+    // 整词未命中 → 合并预切分 + SegmentIt 分词，去重后并行查询
     setLoading('整词未命中，正在分词检索...');
-    const segments = await segmentKeywordSmart(keyword);
+    const preSegs = preSplitText(keyword) || [];
+    const smartSegs = await segmentKeywordSmart(keyword);
     if (gen !== generation) return true;
-    if (!segments || segments.length === 0) return false;
+    // 合并两路候选词段，按文本去重（避免预切分与 SegmentIt 重复查询同一关键词）。
+    // 不再因预切分部分命中就短路——SegmentIt 可能切出更细的词段（如"经济"+"发展"），
+    // 否则这些细粒度命中会被永久丢弃。
+    const seenText = new Set();
+    const allSegs = [];
+    for (const seg of [...preSegs, ...(smartSegs || [])]) {
+      if (!seenText.has(seg.text)) { seenText.add(seg.text); allSegs.push(seg); }
+    }
+    if (allSegs.length === 0) return false;
 
-    const queryResults = await Promise.all(
-      segments.map((seg) =>
-        invoke('cnki_search', { word: seg.text, size: 5 })
-          .then((r) => ({ seg, results: r && r.ok ? (r.results || []) : [] }))
-          .catch(() => ({ seg, results: [] }))
-      )
-    );
+    const queryResults = await querySegments(allSegs);
     if (gen !== generation) return true;
     const withResults = queryResults.filter((r) => r.results.length > 0);
     if (withResults.length === 0) return false;

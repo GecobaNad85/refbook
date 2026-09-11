@@ -37,11 +37,6 @@ async fn cnki_search(word: String, size: Option<i64>) -> cnki::SearchResponse {
 }
 
 #[tauri::command]
-async fn cnki_detail(fn_: String, tablename: String, product: String) -> cnki::DetailResponse {
-    cnki::fetch_entry_detail(&fn_, &tablename, &product).await
-}
-
-#[tauri::command]
 async fn cnki_ping() -> bool {
     cnki::ping().await
 }
@@ -1094,7 +1089,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cnki_search,
-            cnki_detail,
             cnki_ping,
             popup_close,
             popup_open_external,

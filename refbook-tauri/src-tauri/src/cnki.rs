@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const QUERY_URL: &str = "https://t.cnki.net/rbook-api/v1/Criteria/query?uniplatform=NRBOOK";
-const ENTRY_URL: &str = "https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -185,42 +184,6 @@ pub struct DetailResponse {
     pub ok: bool,
     pub content: String,
     pub error: String,
-}
-
-pub async fn fetch_entry_detail(fn_: &str, tablename: &str, product: &str) -> DetailResponse {
-    let client = reqwest::Client::new();
-    let tablename = if tablename.is_empty() { "CRFD2025" } else { tablename };
-    let product = if product.is_empty() { "CRFD" } else { product };
-    let payload = json!({
-        "filename": fn_, "tablename": tablename, "product": product,
-        "platform": "NRBOOK", "type": "REFBOOK", "scope": "content",
-        "cflag": "overlay", "dflag": "词条", "language": "CHS",
-        "pages": "", "sid": "", "idenid": ""
-    });
-    match client.post(ENTRY_URL).json(&payload).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let json: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    return DetailResponse { ok: false, content: String::new(), error: format!("返回非 JSON: {e}") };
-                }
-            };
-            if !status.is_success() || json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-                let msg = json.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                return DetailResponse {
-                    ok: false, content: String::new(),
-                    error: if msg.is_empty() { format!("内容获取失败 (HTTP {status})") } else { msg },
-                };
-            }
-            let content = json.pointer("/data/data/0/content")
-                .and_then(|v| v.as_str())
-                .map(|s| strip_html(s))
-                .unwrap_or_default();
-            DetailResponse { ok: !content.is_empty(), content, error: String::new() }
-        }
-        Err(e) => DetailResponse { ok: false, content: String::new(), error: format!("网络错误: {e}") },
-    }
 }
 
 pub async fn ping() -> bool {
