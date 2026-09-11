@@ -99,12 +99,14 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev
 
       - name: Sync version
+        shell: bash
         env:
           VERSION: "${{ steps.get_version.outputs.version-without-v }}"
         run: |
-          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" refbook-tauri/src-tauri/tauri.conf.json
-          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" refbook-tauri/package.json
-          sed -i "s/^version = .*/version = \"$VERSION\"/" refbook-tauri/src-tauri/Cargo.toml
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" refbook-tauri/src-tauri/tauri.conf.json
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" refbook-tauri/package.json
+          sed -i.bak "s/^version = .*/version = \"$VERSION\"/" refbook-tauri/src-tauri/Cargo.toml
+          rm -f refbook-tauri/src-tauri/tauri.conf.json.bak refbook-tauri/package.json.bak refbook-tauri/src-tauri/Cargo.toml.bak
 
       - name: Install frontend dependencies
         working-directory: refbook-tauri
