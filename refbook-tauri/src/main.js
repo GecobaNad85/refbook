@@ -628,8 +628,15 @@ function initMain() {
         readonlineUrl: item.readonlineUrl || '',
       });
       if (gen !== generation) return;
-      item._fullText = d.ok ? d.content : '';
-      item._fetchError = d.ok ? '' : (d.error || '获取释文失败');
+      // ok=true 但 content 为空：条目释文即摘要（p.image_box 无额外正文），
+      // 退回摘要作为全文，标记已加载（避免重试按钮误导用户）
+      if (d.ok && !d.content) {
+        item._fullText = item.abstract || '';
+        item._fetchError = '';
+      } else {
+        item._fullText = d.ok ? d.content : '';
+        item._fetchError = d.ok ? '' : (d.error || '获取释文失败');
+      }
       render();
     } catch (e) {
       if (gen !== generation) return;

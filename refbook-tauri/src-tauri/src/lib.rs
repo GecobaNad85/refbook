@@ -223,60 +223,60 @@ fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
     if let Some(win) = get_or_create_popup(app) {
         // 恢复标准提示弹窗尺寸（可能被 show_popup_actions 放大过）
         let _ = win.set_size(LogicalSize::new(440.0, 190.0));
-        // 定位到屏幕中央偏上
-        if let Ok(monitor) = win.current_monitor() {
-            if let Some(monitor) = monitor {
-                let size = monitor.size();
-                let scale = monitor.scale_factor();
-                let w = 440.0 * scale;
-                let h = 190.0 * scale;
-                let x = (size.width as f64 - w) / 2.0 / scale;
-                let y = (size.height as f64 - h) / 4.0 / scale;
-                let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
-            }
-        }
+        center_popup(&win, 440.0, 190.0);
         let _ = win.show();
         let _ = set_focus_delayed(&win);
-        let _ = win.emit(
-            "popup:message",
-            serde_json::json!({"msg": msg, "isError": is_error}),
-        );
+        let payload = serde_json::json!({"msg": msg, "isError": is_error});
+        emit_popup_message(&win, payload);
     }
 }
 
 /// 在弹窗中显示提示信息并附带操作按钮（如 退出登录 / 重新登录）。
-/// actions: [(id, label)]，按钮点击后前端 emit "popup:action" 事件携带 id，
-/// 由 Rust 侧 main 窗口监听……实际由本函数直接前端 invoke 对应命令。
-/// 这里简化：按钮 id 直接映射到已知动作（logout/relogin），由前端 invoke 相应命令。
+/// actions: [(id, label)]，按钮 id（logout/relogin）由前端 invoke popup_action 命令处理。
 fn show_popup_actions(app: &AppHandle, msg: &str, actions: &[(&str, &str)], is_error: bool) {
     if let Some(win) = get_or_create_popup(app) {
-        if let Ok(monitor) = win.current_monitor() {
-            if let Some(monitor) = monitor {
-                let size = monitor.size();
-                let scale = monitor.scale_factor();
-                let w = 440.0 * scale;
-                let h = 230.0 * scale;
-                let x = (size.width as f64 - w) / 2.0 / scale;
-                let y = (size.height as f64 - h) / 4.0 / scale;
-                let _ = win.set_size(LogicalSize::new(440.0, 230.0));
-                let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
-            }
-        }
+        let _ = win.set_size(LogicalSize::new(440.0, 230.0));
+        center_popup(&win, 440.0, 230.0);
         let _ = win.show();
         let _ = set_focus_delayed(&win);
         let actions_arr: Vec<serde_json::Value> = actions
             .iter()
             .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
             .collect();
-        let _ = win.emit(
-            "popup:message",
-            serde_json::json!({
-                "msg": msg,
-                "isError": is_error,
-                "actions": actions_arr,
-            }),
-        );
+        let payload = serde_json::json!({
+            "msg": msg,
+            "isError": is_error,
+            "actions": actions_arr,
+        });
+        emit_popup_message(&win, payload);
     }
+}
+
+/// 把弹窗定位到屏幕中央偏上
+fn center_popup(win: &WebviewWindow, w: f64, h: f64) {
+    if let Ok(monitor) = win.current_monitor() {
+        if let Some(monitor) = monitor {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            let pw = w * scale;
+            let ph = h * scale;
+            let x = (size.width as f64 - pw) / 2.0 / scale;
+            let y = (size.height as f64 - ph) / 4.0 / scale;
+            let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+        }
+    }
+}
+
+/// 向弹窗窗口发送 popup:message 事件。弹窗首次创建时页面 JS 尚未加载、监听器未注册，
+/// 首次 emit 会丢失 → 延迟 300ms 重发一次确保送达。前端 popupInited 标志防止重复初始化，
+/// innerHTML 覆盖为相同内容，双重送达无副作用。
+fn emit_popup_message(win: &WebviewWindow, payload: serde_json::Value) {
+    let _ = win.emit("popup:message", payload.clone());
+    let win2 = win.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = win2.emit("popup:message", payload);
+    });
 }
 
 /// 延迟设置焦点，避免窗口刚 show 时焦点立即丢失
@@ -1208,6 +1208,11 @@ async fn cnki_detail_auth(
     // 最小化 8s 无结果 → 视为最小化冻结了 JS，恢复可见继续取（保证功能）
     let minimized_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let mut silent_polls = 0u32;
+    // 稳定性检查：非空释文需连续 2 次相同才接受（防中间页残留 / 部分渲染误判）
+    let mut last_text = String::new();
+    let mut stable_count = 0u32;
+    // 空释文（p.image_box 存在但无文本）：连续 4 次（~1s）才接受为"条目无正文"
+    let mut empty_exists_count = 0u32;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         if minimized && std::time::Instant::now() > minimized_deadline {
@@ -1230,20 +1235,45 @@ async fn cnki_detail_auth(
                 silent_polls = 0;
                 // eval_with_callback 回调收到的是 JS 求值结果的 JSON 序列化字符串
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(s) = v.as_str() {
-                        let text = s.trim().to_string();
-                        // 仅当读到实际释文（有足够字符且非加载/错误占位符）才返回
-                        let chars = text.chars().count();
-                        let is_placeholder = ["加载中", "正在加载", "加载失败", "系统异常", "请登录"]
-                            .iter()
-                            .any(|p| text.contains(p));
-                        if chars > 20 && !is_placeholder {
-                            if minimized { restore_min(&w); }
-                            if !was_visible { let _ = w.hide(); }
-                            eprintln!("[cnki_detail_auth] FOUND full text, {} chars", text.len());
-                            unlock();
-                            return cnki::DetailResponse { ok: true, content: text, error: String::new() };
+                    let exists = v.get("exists").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    let is_placeholder = ["加载中", "正在加载", "加载失败", "系统异常", "请登录"]
+                        .iter()
+                        .any(|p| text.contains(p));
+
+                    if exists && !is_placeholder {
+                        if !text.is_empty() {
+                            // 有实际释文（不论长短）：连续 2 次相同即接受
+                            if text == last_text {
+                                stable_count += 1;
+                                if stable_count >= 2 {
+                                    if minimized { restore_min(&w); }
+                                    if !was_visible { let _ = w.hide(); }
+                                    eprintln!("[cnki_detail_auth] FOUND full text, {} chars", text.len());
+                                    unlock();
+                                    return cnki::DetailResponse { ok: true, content: text, error: String::new() };
+                                }
+                            } else {
+                                last_text = text.clone();
+                                stable_count = 1;
+                            }
+                            empty_exists_count = 0;
+                        } else {
+                            // p.image_box 存在但文本为空：条目可能无正文（释文即摘要）
+                            stable_count = 0;
+                            empty_exists_count += 1;
+                            if empty_exists_count >= 4 {
+                                if minimized { restore_min(&w); }
+                                if !was_visible { let _ = w.hide(); }
+                                eprintln!("[cnki_detail_auth] p.image_box empty for 1s, accepting empty content");
+                                unlock();
+                                return cnki::DetailResponse { ok: true, content: String::new(), error: String::new() };
+                            }
                         }
+                    } else {
+                        // 元素未出现或是占位符：重置稳定性计数，继续等待
+                        stable_count = 0;
+                        empty_exists_count = 0;
                     }
                 }
             }
@@ -1272,17 +1302,19 @@ async fn cnki_detail_auth(
     }
 }
 
-/// 读取当前页面 p.image_box 的释文；未渲染时返回空字符串
+/// 读取当前页面 p.image_box 的释文，返回 {exists, text}。
+/// exists=true 表示元素已在 DOM 中（页面已渲染详情页）；text 为去空白后的文本。
+/// Rust 侧据此区分"页面未加载"（exists=false，继续轮询）与"条目无正文"（exists=true,
+/// text 空，返回空内容而非超时）。短释文（如"golden brick"）也能被接受。
 ///（eval_with_callback 把 JS 求值结果 JSON 序列化后回调给 Rust）
 const CNKI_EVAL_EXTRACT: &str = r#"(function () {
   try {
     var box = document.querySelector('p.image_box');
     if (box) {
-      var t = (box.textContent || '').trim();
-      if (t) return t;
+      return { exists: true, text: (box.textContent || '').trim() };
     }
   } catch (_) {}
-  return '';
+  return { exists: false, text: '' };
 })()"#;
 
 fn urlencode(s: &str) -> String {
