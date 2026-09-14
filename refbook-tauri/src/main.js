@@ -26,58 +26,46 @@ function getBookEntryUrl(item) {
 let popupInited = false;
 let popupContainer = null;
 
-// 弹窗窗口（加载 popup.html）不跑主窗口逻辑——只注册 popup:message 监听。
-// 避免在弹窗里初始化查询 UI、cnki_ping、main:query 等无关副作用。
-const isPopupWindow =
-  window.__TAURI__ && window.__TAURI__.window &&
-  window.__TAURI__.window.getCurrentWindow().label === 'popup';
+// 弹窗窗口（加载 popup.html）只注册 popup:message 监听，不跑主窗口逻辑。
+// 主窗口绝不能处理 popup:message——即便 Rust 侧 emit_to 已定向到 popup，
+// 也避免任何全局事件泄漏到主窗口的 popup-view（index.html 已移除该节点）。
+const isPopupWindow = window.__TAURI__.window.getCurrentWindow().label === 'popup';
 
 if (!isPopupWindow) {
   initMain();
 }
 
-listen('popup:message', (e) => {
-  if (!popupInited) {
-    const mv = document.getElementById('main-view');
-    if (mv) mv.hidden = true;
-    popupContainer = document.getElementById('popup-view');
-    if (popupContainer) popupContainer.hidden = false;
-    popupInited = true;
-  }
-  const m = e.payload;
-  const actions = Array.isArray(m.actions) ? m.actions : [];
-  // 多行消息（含 \n）用 white-space: pre-line 渲染；操作按钮横排居中
-  const msgHtml = `<div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}" style="white-space:pre-line;">${esc(m.msg)}</div>`;
-  const actionsHtml = actions.length
-    ? `<div class="tb-popup-actions">${
-        actions.map((a) => `<button class="tb-popup-btn" data-act="${esc(a.id)}">${esc(a.label)}</button>`).join('')
-      }<button class="tb-popup-btn tb-popup-btn-ghost" data-act="close">确定</button></div>`
-    : '';
-  popupContainer.innerHTML = `
-    <div class="tb-popup">
-      <div class="tb-header">
-        <span class="tb-title">工具书查词</span>
-        <button class="tb-close" data-act="close">×</button>
-      </div>
-      <div class="tb-body">${msgHtml}</div>
-      ${actionsHtml}
-    </div>`;
-  popupContainer.onclick = (e2) => {
-    if (!(e2.target instanceof Element)) return;
-    const act = e2.target.dataset.act;
-    if (!act) return;
-    if (act === 'close') {
-      invoke('popup_close');
-    } else {
-      // 退出登录/重新登录等动作交由后端处理（会先关闭弹窗再执行）
-      invoke('popup_action', { action: act });
+if (isPopupWindow) {
+  // 弹窗仅承载单条提示信息（如"未检测到选中文本"）；带操作的确认对话
+  // （如已登录退出确认）已改用原生 tauri-plugin-dialog，不再经此弹窗。
+  listen('popup:message', (e) => {
+    if (!popupInited) {
+      popupContainer = document.getElementById('popup-view');
+      if (!popupContainer) return;
+      popupContainer.hidden = false;
+      popupInited = true;
     }
-  };
-});
+    const m = e.payload;
+    // 多行消息（含 \n）用 white-space: pre-line 渲染
+    const msgHtml = `<div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}" style="white-space:pre-line;">${esc(m.msg)}</div>`;
+    popupContainer.innerHTML = `
+      <div class="tb-popup">
+        <div class="tb-header">
+          <span class="tb-title">工具书查词</span>
+          <button class="tb-close" data-act="close">×</button>
+        </div>
+        <div class="tb-body">${msgHtml}</div>
+      </div>`;
+    popupContainer.onclick = (e2) => {
+      if (!(e2.target instanceof Element)) return;
+      if (e2.target.dataset.act === 'close') invoke('popup_close');
+    };
+  });
 
-window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') invoke('popup_close');
-});
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') invoke('popup_close');
+  });
+}
 
 // ============================================================
 // 分词与繁简转换（移植自浏览器扩展 content.js，去 sandbox 直接用 CDN 全局）

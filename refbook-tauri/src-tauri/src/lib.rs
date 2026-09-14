@@ -190,7 +190,7 @@ fn trigger_selection_lookup(app: &tauri::AppHandle) {
     // 唤起主窗口并在主窗口查询（结果在主窗口完整展示，弹窗不再承载结果）
     show_main(app);
     if let Some(main) = app.get_webview_window("main") {
-        let _ = main.emit("main:query", text.trim().to_string());
+        let _ = main.emit_to(tauri::EventTarget::webview_window("main"), "main:query", text.trim().to_string());
     }
 }
 
@@ -218,36 +218,14 @@ fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
     guard.clone()
 }
 
-/// 在弹窗中显示提示信息（可关闭）
+/// 在弹窗中显示单条提示信息（可关闭）
 fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
     if let Some(win) = get_or_create_popup(app) {
-        // 恢复标准提示弹窗尺寸（可能被 show_popup_actions 放大过）
         let _ = win.set_size(LogicalSize::new(440.0, 190.0));
         center_popup(&win, 440.0, 190.0);
         let _ = win.show();
         let _ = set_focus_delayed(&win);
         let payload = serde_json::json!({"msg": msg, "isError": is_error});
-        emit_popup_message(&win, payload);
-    }
-}
-
-/// 在弹窗中显示提示信息并附带操作按钮（如 退出登录 / 重新登录）。
-/// actions: [(id, label)]，按钮 id（logout/relogin）由前端 invoke popup_action 命令处理。
-fn show_popup_actions(app: &AppHandle, msg: &str, actions: &[(&str, &str)], is_error: bool) {
-    if let Some(win) = get_or_create_popup(app) {
-        let _ = win.set_size(LogicalSize::new(440.0, 230.0));
-        center_popup(&win, 440.0, 230.0);
-        let _ = win.show();
-        let _ = set_focus_delayed(&win);
-        let actions_arr: Vec<serde_json::Value> = actions
-            .iter()
-            .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
-            .collect();
-        let payload = serde_json::json!({
-            "msg": msg,
-            "isError": is_error,
-            "actions": actions_arr,
-        });
         emit_popup_message(&win, payload);
     }
 }
@@ -267,15 +245,18 @@ fn center_popup(win: &WebviewWindow, w: f64, h: f64) {
     }
 }
 
-/// 向弹窗窗口发送 popup:message 事件。弹窗首次创建时页面 JS 尚未加载、监听器未注册，
-/// 首次 emit 会丢失 → 延迟 300ms 重发一次确保送达。前端 popupInited 标志防止重复初始化，
-/// innerHTML 覆盖为相同内容，双重送达无副作用。
+/// 向弹窗窗口发送 popup:message 事件。必须用 emit_to 定向到 "popup" 窗口——
+/// WebviewWindow::emit 是全局广播（经 manager().emit 发给所有窗口），会同时触达
+/// 主窗口，导致主窗口的 popup-view 也渲染出一份关不掉的重复弹窗。
+/// 弹窗首次创建时页面 JS 尚未加载、监听器未注册，首次 emit 会丢失 → 延迟 300ms
+/// 重发一次确保送达。前端 popupInited 标志防止重复初始化，innerHTML 覆盖为相同
+/// 内容，双重送达无副作用。
 fn emit_popup_message(win: &WebviewWindow, payload: serde_json::Value) {
-    let _ = win.emit("popup:message", payload.clone());
+    let _ = win.emit_to(tauri::EventTarget::webview_window("popup"), "popup:message", payload.clone());
     let win2 = win.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let _ = win2.emit("popup:message", payload);
+        let _ = win2.emit_to(tauri::EventTarget::webview_window("popup"), "popup:message", payload);
     });
 }
 
@@ -338,7 +319,7 @@ fn show_float_if_enabled(app: &AppHandle) {
     }
 }
 
-/// 拼接托盘登录菜单项的文字：已登录带用户名/机构，未登录为"CNKI 登录…"
+/// 拼接托盘登录菜单项的文字：已登录显示"已登录（用户名）"，未登录为"CNKI 登录…"
 fn login_menu_text(logged_in: bool, display_name: &str) -> String {
     if logged_in {
         let name = display_name.trim();
@@ -374,20 +355,36 @@ fn refresh_login_menu_text(app: &AppHandle, logged_in: bool, display_name: &str)
     }
 }
 
-/// 已登录时点击托盘"已登录"项：弹窗提示当前登录用户，提供 确定/退出登录/重新登录。
+/// 已登录时点击托盘"退出"项：用原生对话框确认是否退出登录。
+/// 标题"账号已登录"+正文"如需切换账号/重新登录点击退出"，按钮"确定"/"退出"。
+/// 确定 → 仅关闭对话框；退出 → 调 cnki_logout 清除登录态（退出后即未登录，
+/// 可再点托盘"CNKI 登录…"重新登录，等价于原"重新登录"流程）。
 fn show_logged_in_popup(app: &AppHandle, display_name: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
     let name = display_name.trim();
-    let msg = if name.is_empty() {
-        "当前已登录 CNKI。".to_string()
+    let title = if name.is_empty() {
+        "账号已登录".to_string()
     } else {
-        format!("当前已登录 CNKI\n用户：{name}")
+        format!("账号已登录（{name}）")
     };
-    show_popup_actions(
-        app,
-        &msg,
-        &[("logout", "退出登录"), ("relogin", "重新登录")],
-        false,
-    );
+    let app_h = app.clone();
+    app.dialog()
+        .message("如需切换账号/重新登录点击退出")
+        .title(&title)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "确定".to_string(),
+            "退出".to_string(),
+        ))
+        .show(move |ok| {
+            // true = 点了"确定"：不操作；false = 点了"退出"：退出登录。
+            // 退出后即未登录，可再点托盘"CNKI 登录…"重新登录（等价原"重新登录"流程）。
+            if !ok {
+                let app_h2 = app_h.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = cnki_logout(app_h2).await;
+                });
+            }
+        });
 }
 
 /// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / CNKI登录 / 退出
@@ -424,7 +421,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main(app),
             "lookup" => trigger_selection_lookup(app),
-            // 已登录 → 弹"已登录"信息窗（确定/退出登录/重新登录）；
+            // 已登录 → 原生对话框确认是否退出登录（标题"账号已登录"+正文提示）；
             // 未登录 → 打开登录窗口。读缓存（即使过期也先用，避免阻塞菜单回调），
             // 同时后台刷新登录态、刷新托盘文字。
             "login" => {
@@ -1080,27 +1077,6 @@ async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
     serde_json::json!({ "ok": !li, "loggedIn": li, "cleared": cleared })
 }
 
-/// 弹窗操作按钮回调：前端点击 退出登录/重新登录 等按钮时调用。
-/// action: "logout" → 退出登录后关闭弹窗；"relogin" → 退出登录后打开登录窗口。
-#[tauri::command]
-async fn popup_action(app: tauri::AppHandle, window: WebviewWindow, action: String) {
-    // 先关闭弹窗
-    if window.label() == "popup" {
-        let _ = window.hide();
-    }
-    match action.as_str() {
-        "logout" => {
-            let _ = cnki_logout(app.clone()).await;
-        }
-        "relogin" => {
-            // 先退出当前登录态，再打开登录窗口
-            let _ = cnki_logout(app.clone()).await;
-            open_cnki_login(app);
-        }
-        _ => {}
-    }
-}
-
 /// 查询条目全文（桌面版主路径）：在 cnki-auth webview 内导航到条目的跳转链接
 /// （readonline_url，bar.cnki.net），登录态会话经 #cnki_redirect 中转后，bar.cnki.net
 /// 302 到带 invoice/nonce 的 gongjushu 详情 URL，SPA 将全文渲染到 p.image_box。
@@ -1336,6 +1312,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             popup: Mutex::new(None),
             float: Mutex::new(None),
@@ -1428,7 +1405,6 @@ pub fn run() {
             cnki_login_status,
             cnki_detail_auth,
             cnki_logout,
-            popup_action,
             focus_main,
         ])
         .run(tauri::generate_context!())
