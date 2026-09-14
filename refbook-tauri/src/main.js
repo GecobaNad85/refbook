@@ -26,13 +26,22 @@ function getBookEntryUrl(item) {
 let popupInited = false;
 let popupContainer = null;
 
-initMain();
+// 弹窗窗口（加载 popup.html）不跑主窗口逻辑——只注册 popup:message 监听。
+// 避免在弹窗里初始化查询 UI、cnki_ping、main:query 等无关副作用。
+const isPopupWindow =
+  window.__TAURI__ && window.__TAURI__.window &&
+  window.__TAURI__.window.getCurrentWindow().label === 'popup';
+
+if (!isPopupWindow) {
+  initMain();
+}
 
 listen('popup:message', (e) => {
   if (!popupInited) {
-    document.getElementById('main-view').hidden = true;
+    const mv = document.getElementById('main-view');
+    if (mv) mv.hidden = true;
     popupContainer = document.getElementById('popup-view');
-    popupContainer.hidden = false;
+    if (popupContainer) popupContainer.hidden = false;
     popupInited = true;
   }
   const m = e.payload;

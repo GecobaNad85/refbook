@@ -202,7 +202,7 @@ fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
         let popup = tauri::WebviewWindowBuilder::new(
             app,
             "popup",
-            tauri::WebviewUrl::App("index.html".into()),
+            tauri::WebviewUrl::App("popup.html".into()),
         )
         .title("划词查询")
         .inner_size(440.0, 190.0)
