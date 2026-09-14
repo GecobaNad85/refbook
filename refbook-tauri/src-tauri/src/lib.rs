@@ -18,6 +18,9 @@ struct AppState {
     /// 启动预检的 CNKI 登录态缓存：None = 尚未预检
     ///（预检由 setup 里后台任务完成，前端"查看全文"读这里，不再现建/现显窗口）
     login_cached: Mutex<Option<LoginCache>>,
+    /// 托盘"CNKI 登录"菜单项句柄：用于随登录态切换文字
+    ///（已登录 → "已登录（用户名/机构）"，未登录 → "CNKI 登录…"）
+    login_menu: Mutex<Option<MenuItem<tauri::Wry>>>,
     /// cnki_detail_auth 独占锁：同一 cnki-auth 窗口同时只能有一个取全文任务，
     /// 否则两次 navigate 互相覆盖、轮询同一 p.image_box 会返回错误的条目内容。
     detail_busy: Mutex<bool>,
@@ -28,6 +31,8 @@ struct AppState {
 struct LoginCache {
     logged_in: bool,
     error: String,
+    /// 已登录时从页面 DOM 提取的展示名（用户名/机构名），未登录或提取失败为空
+    display_name: String,
     checked_at: std::time::Instant,
 }
 
@@ -216,6 +221,8 @@ fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
 /// 在弹窗中显示提示信息（可关闭）
 fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
     if let Some(win) = get_or_create_popup(app) {
+        // 恢复标准提示弹窗尺寸（可能被 show_popup_actions 放大过）
+        let _ = win.set_size(LogicalSize::new(440.0, 190.0));
         // 定位到屏幕中央偏上
         if let Ok(monitor) = win.current_monitor() {
             if let Some(monitor) = monitor {
@@ -237,6 +244,41 @@ fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
     }
 }
 
+/// 在弹窗中显示提示信息并附带操作按钮（如 退出登录 / 重新登录）。
+/// actions: [(id, label)]，按钮点击后前端 emit "popup:action" 事件携带 id，
+/// 由 Rust 侧 main 窗口监听……实际由本函数直接前端 invoke 对应命令。
+/// 这里简化：按钮 id 直接映射到已知动作（logout/relogin），由前端 invoke 相应命令。
+fn show_popup_actions(app: &AppHandle, msg: &str, actions: &[(&str, &str)], is_error: bool) {
+    if let Some(win) = get_or_create_popup(app) {
+        if let Ok(monitor) = win.current_monitor() {
+            if let Some(monitor) = monitor {
+                let size = monitor.size();
+                let scale = monitor.scale_factor();
+                let w = 440.0 * scale;
+                let h = 230.0 * scale;
+                let x = (size.width as f64 - w) / 2.0 / scale;
+                let y = (size.height as f64 - h) / 4.0 / scale;
+                let _ = win.set_size(LogicalSize::new(440.0, 230.0));
+                let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+            }
+        }
+        let _ = win.show();
+        let _ = set_focus_delayed(&win);
+        let actions_arr: Vec<serde_json::Value> = actions
+            .iter()
+            .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
+            .collect();
+        let _ = win.emit(
+            "popup:message",
+            serde_json::json!({
+                "msg": msg,
+                "isError": is_error,
+                "actions": actions_arr,
+            }),
+        );
+    }
+}
+
 /// 延迟设置焦点，避免窗口刚 show 时焦点立即丢失
 fn set_focus_delayed(win: &WebviewWindow) {
     let win = win.clone();
@@ -250,7 +292,22 @@ fn set_focus_delayed(win: &WebviewWindow) {
 fn show_main(app: &AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.show();
+        let _ = main.unminimize();
         let _ = main.set_focus();
+        // Linux（X11/Wayland）窗口管理器上 set_focus 不保证把窗口抬到最顶层：
+        // 快捷键划词唤起时主窗口可能仍被原焦点窗口（如浏览器）遮挡，结果窗口
+        // 置于顶层却不可见。短暂开启 always_on_top 强制置顶，再延迟关闭，确保
+        // 窗口管理器先把窗口抬到最前再取消置顶。
+        #[cfg(target_os = "linux")]
+        {
+            let m = main.clone();
+            std::thread::spawn(move || {
+                let _ = m.set_always_on_top(true);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                let _ = m.set_focus();
+                let _ = m.set_always_on_top(false);
+            });
+        }
     }
     hide_float(app);
 }
@@ -281,6 +338,58 @@ fn show_float_if_enabled(app: &AppHandle) {
     }
 }
 
+/// 拼接托盘登录菜单项的文字：已登录带用户名/机构，未登录为"CNKI 登录…"
+fn login_menu_text(logged_in: bool, display_name: &str) -> String {
+    if logged_in {
+        let name = display_name.trim();
+        if name.is_empty() {
+            "已登录 CNKI".to_string()
+        } else {
+            // 菜单文字过长会被截断，限制展示名长度
+            let n = if name.chars().count() > 20 {
+                let mut s = String::new();
+                for (i, c) in name.chars().enumerate() {
+                    if i >= 18 { break; }
+                    s.push(c);
+                }
+                s.push('…');
+                s
+            } else {
+                name.to_string()
+            };
+            format!("已登录（{n}）")
+        }
+    } else {
+        "CNKI 登录…".to_string()
+    }
+}
+
+/// 刷新托盘"CNKI 登录"菜单项文字，使其反映当前登录态。
+fn refresh_login_menu_text(app: &AppHandle, logged_in: bool, display_name: &str) {
+    let state = app.state::<AppState>();
+    let item = state.login_menu.lock().unwrap().clone();
+    if let Some(item) = item {
+        let text = login_menu_text(logged_in, display_name);
+        let _ = item.set_text(text);
+    }
+}
+
+/// 已登录时点击托盘"已登录"项：弹窗提示当前登录用户，提供 确定/退出登录/重新登录。
+fn show_logged_in_popup(app: &AppHandle, display_name: &str) {
+    let name = display_name.trim();
+    let msg = if name.is_empty() {
+        "当前已登录 CNKI。".to_string()
+    } else {
+        format!("当前已登录 CNKI\n用户：{name}")
+    };
+    show_popup_actions(
+        app,
+        &msg,
+        &[("logout", "退出登录"), ("relogin", "重新登录")],
+        false,
+    );
+}
+
 /// 创建系统托盘：左键唤起主窗口，菜单提供 显示主窗口 / 划词查询 / 悬浮图标开关 / CNKI登录 / 退出
 fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -298,6 +407,11 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .separator()
         .item(&quit)
         .build()?;
+    // 保存登录菜单项句柄，供 refresh_login_menu_text 随登录态切换文字
+    {
+        let state = app.state::<AppState>();
+        *state.login_menu.lock().unwrap() = Some(login.clone());
+    }
 
     let builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
@@ -310,7 +424,42 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => show_main(app),
             "lookup" => trigger_selection_lookup(app),
-            "login" => open_cnki_login(app.clone()),
+            // 已登录 → 弹"已登录"信息窗（确定/退出登录/重新登录）；
+            // 未登录 → 打开登录窗口。读缓存（即使过期也先用，避免阻塞菜单回调），
+            // 同时后台刷新登录态、刷新托盘文字。
+            "login" => {
+                let cached = app.state::<AppState>().login_cached.lock().unwrap().clone();
+                let (logged_in, display_name) = match cached {
+                    Some(c) => (c.logged_in, c.display_name),
+                    None => (false, String::new()),
+                };
+                if logged_in {
+                    show_logged_in_popup(app, &display_name);
+                } else {
+                    open_cnki_login(app.clone());
+                }
+                // 后台刷新登录态（缓存可能过期），刷新托盘菜单文字
+                let app_h = app.clone();
+                let app_h2 = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let _ = app_h.run_on_main_thread(move || {
+                        let live = check_cnki_login_live(&app_h2);
+                        let li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let dn = live.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let state = app_h2.state::<AppState>();
+                        let mut guard = state.login_cached.lock().unwrap();
+                        *guard = Some(LoginCache {
+                            logged_in: li,
+                            error: live.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            display_name: dn.clone(),
+                            checked_at: std::time::Instant::now(),
+                        });
+                        drop(guard);
+                        refresh_login_menu_text(&app_h2, li, &dn);
+                    });
+                });
+            }
             "toggle-float" => {
                 // 从我们维护的 float_enabled 推导新状态（而非 is_checked()——
                 // 原生菜单点击时部分平台会自动翻转 check，再读 is_checked 会二次翻转导致状态不变）
@@ -547,9 +696,17 @@ const CNKI_AUTH_INIT_SCRIPT: &str = r#"
           if ((btns[i].textContent || '').trim() === '登录') { loginTab = btns[i]; break; }
         }
         if (!loginTab) {
-          // 已登录或无登录入口：结束登录模式
+          // 已登录或无登录入口：在登录小窗中显示"已登录"提示，而非暴露整个 gongjushu 页面
           clearInterval(timer);
           try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+          var notice = document.createElement('div');
+          notice.textContent = '当前已登录 CNKI，可关闭此窗口。如需切换账号，请先退出登录再重新打开登录。';
+          notice.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-size:15px;color:#333;line-height:1.8;padding:24px 32px;background:#fff;border-radius:8px;box-shadow:0 2px 16px rgba(0,0,0,0.1);z-index:999999;max-width:80%;';
+          Array.prototype.forEach.call(document.body.children, function (el) {
+            if (el.tagName === 'SCRIPT' || el.tagName === 'NOSCRIPT') return;
+            el.style.display = 'none';
+          });
+          document.body.appendChild(notice);
           return;
         }
         try { if (!loginTab.dataset.tbClicked) { loginTab.dataset.tbClicked = '1'; loginTab.click(); } } catch (_) {}
@@ -559,8 +716,13 @@ const CNKI_AUTH_INIT_SCRIPT: &str = r#"
         if (!box || !input) return;
         try {
           clearInterval(timer);
+          // 登录表单上方加标题条，让登录小窗有明确上下文
+          var header = document.createElement('div');
+          header.textContent = 'CNKI 工具书 · 登录';
+          header.style.cssText = 'font-size:16px;font-weight:600;color:#2347ff;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #e8e8e8;';
           // 剪切登录表单到 body 顶层（保留元素自身的事件绑定）
           document.body.appendChild(box);
+          box.insertBefore(header, box.firstChild);
           box.style.cssText = [
             'display:block !important',
             'position:fixed !important',
@@ -618,6 +780,43 @@ fn get_or_create_cnki_auth(app: &AppHandle) -> Option<WebviewWindow> {
     Some(w)
 }
 
+/// 从 gongjushu cookie 中提取已登录用户的展示名。
+/// Ecp_LoginStuts 的值是一段 JSON（字段经 URL 转义），含 UserName/ShowName：
+/// {"IsAutoLogin":true,"UserName":"TTOD","ShowName":"%E5%90%8C%E6%96%B9...","UserType":"bk",...}
+/// 优先用 BUserName/BShowName（绑定的机构账号），其次 UserName/ShowName。
+/// ShowName 对个人账号常为通用欢迎语（"同方知网欢迎您"），不算真实身份 → 退回 UserName。
+fn extract_display_name_from_cookies(cookies: &[tauri::webview::Cookie<'_>]) -> String {
+    let raw = cookies.iter().find(|c| c.name() == "Ecp_LoginStuts");
+    let Some(cookie) = raw else { return String::new(); };
+    // cookie value 的 JSON 字段值经 URL 编码（%XX），先整体 url_decode 再解析
+    let decoded = url_decode(cookie.value());
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(&decoded) else {
+        return String::new();
+    };
+    let pick = |field: &str| -> String {
+        j.get(field)
+            .and_then(|v| v.as_str())
+            .map(|s| url_decode(s.trim()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+    };
+    // 优先机构账号（B 前缀字段），其次个人账号
+    let b_user = pick("BUserName");
+    let b_show = pick("BShowName");
+    let user = pick("UserName");
+    let show = pick("ShowName");
+    // 通用欢迎语不是真实身份，排除
+    let is_generic = |s: &str| s.is_empty() || s.contains("欢迎您") || s.contains("欢迎");
+    if !b_user.is_empty() || !b_show.is_empty() {
+        return if !is_generic(&b_show) { b_show } else { b_user };
+    }
+    if !is_generic(&show) {
+        show
+    } else {
+        user
+    }
+}
+
 /// 实时检查 CNKI 登录态：创建（或复用）隐藏的 cnki-auth 窗口，读 gongjushu 域 cookie。
 /// 返回 { loggedIn, cookies, error }。
 /// 注意：本函数创建窗口时必须保持隐藏（WebviewWindowBuilder .visible(false)），
@@ -643,7 +842,6 @@ fn check_cnki_login_live(app: &AppHandle) -> serde_json::Value {
     };
     match w.cookies_for_url(url) {
         Ok(cookies) => {
-            // 日志带 value（截断），用于观察 c_m_expire 等是否携带过期时间信息
             let pairs: Vec<String> = cookies
                 .iter()
                 .map(|c| {
@@ -663,7 +861,13 @@ fn check_cnki_login_live(app: &AppHandle) -> serde_json::Value {
             eprintln!(
                 "[cnki_login_status] gongjushu cookies: {pairs:?} -> session={session_cookie}, expired={expired}, logged_in={logged_in}"
             );
-            serde_json::json!({ "loggedIn": logged_in, "cookies": pairs, "error": "" })
+            // 已登录时从 Ecp_LoginStuts cookie 的 JSON 值提取用户名/机构展示名
+            let display_name = if logged_in {
+                extract_display_name_from_cookies(&cookies)
+            } else {
+                String::new()
+            };
+            serde_json::json!({ "loggedIn": logged_in, "cookies": pairs, "error": "", "displayName": display_name })
         }
         Err(e) => {
             eprintln!("[cnki_login_status] cookies_for_url error: {e}");
@@ -731,7 +935,12 @@ fn cnki_login_status(app: tauri::AppHandle) -> serde_json::Value {
     let cached = state.login_cached.lock().unwrap().clone();
     if let Some(c) = cached {
         if c.checked_at.elapsed() < std::time::Duration::from_secs(60) {
-            return serde_json::json!({ "loggedIn": c.logged_in, "cookies": [], "error": c.error });
+            return serde_json::json!({
+                "loggedIn": c.logged_in,
+                "cookies": [],
+                "error": c.error,
+                "displayName": c.display_name,
+            });
         }
     }
     let live = check_cnki_login_live(&app);
@@ -740,12 +949,20 @@ fn cnki_login_status(app: tauri::AppHandle) -> serde_json::Value {
         live.get("loggedIn").and_then(|v| v.as_bool()),
         live.get("error").and_then(|v| v.as_str()),
     ) {
+        let dn = live
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let mut guard = state.login_cached.lock().unwrap();
         *guard = Some(LoginCache {
             logged_in: li,
             error: err.to_string(),
+            display_name: dn.clone(),
             checked_at: std::time::Instant::now(),
         });
+        // 登录态变化后刷新托盘菜单文字
+        refresh_login_menu_text(&app, li, &dn);
     }
     live
 }
@@ -774,6 +991,7 @@ fn open_cnki_login(app: tauri::AppHandle) {
                 Err(_) => return,
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            let mut dn_cell: Option<String> = None;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(800));
                 // 登录窗口已被用户关闭 → 结束监控
@@ -785,15 +1003,101 @@ fn open_cnki_login(app: tauri::AppHandle) {
                 }
                 let logged = w2
                     .cookies_for_url(url.clone())
-                    .map(|cs| cs.iter().any(|c| matches!(c.name(), "Ecp_LoginStuts" | "c_m_LinID")))
+                    .map(|cs| {
+                        let is_logged = cs.iter().any(|c| matches!(c.name(), "Ecp_LoginStuts" | "c_m_LinID"));
+                        if is_logged {
+                            // 顺便提取展示名（Ecp_LoginStuts cookie 的 JSON 值）
+                            dn_cell = Some(extract_display_name_from_cookies(&cs));
+                        }
+                        is_logged
+                    })
                     .unwrap_or(false);
                 if logged && !w2.is_minimized().unwrap_or(true) {
                     eprintln!("[login-monitor] logged in, hiding login window");
+                    let dn = dn_cell.take().unwrap_or_default();
+                    {
+                        let state = w2.app_handle().state::<AppState>();
+                        let mut guard = state.login_cached.lock().unwrap();
+                        *guard = Some(LoginCache {
+                            logged_in: true,
+                            error: String::new(),
+                            display_name: dn.clone(),
+                            checked_at: std::time::Instant::now(),
+                        });
+                    }
+                    refresh_login_menu_text(&w2.app_handle(), true, &dn);
                     let _ = w2.hide();
                     break;
                 }
             }
         });
+    }
+}
+
+/// 退出 CNKI 登录：用 webview 原生 delete_cookie 清除 gongjushu 域所有 cookie
+///（含 HttpOnly 会话 cookie，JS document.cookie 清不掉），再刷新缓存与托盘菜单。
+#[tauri::command]
+async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
+    let w = match app.get_webview_window("cnki-auth") {
+        Some(w) => w,
+        None => {
+            return serde_json::json!({ "ok": false, "error": "登录窗口未初始化" });
+        }
+    };
+    let url: tauri::Url = "https://gongjushu.cnki.net/".parse().unwrap();
+    // 读出当前所有 gongjushu 域 cookie，逐个 delete_cookie 清除（原生 API 能清 HttpOnly）
+    let cleared = match w.cookies_for_url(url) {
+        Ok(cookies) => {
+            let n = cookies.len();
+            for c in &cookies {
+                let _ = w.delete_cookie(c.clone());
+            }
+            eprintln!("[cnki_logout] cleared {n} cookies");
+            n
+        }
+        Err(e) => {
+            eprintln!("[cnki_logout] cookies_for_url error: {e}");
+            0
+        }
+    };
+    // delete_cookie 不保证立即生效，短暂等待后复检
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // 刷新缓存与托盘菜单
+    let live = check_cnki_login_live(&app);
+    let li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dn = live.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.login_cached.lock().unwrap();
+        *guard = Some(LoginCache {
+            logged_in: li,
+            error: live.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            display_name: dn.clone(),
+            checked_at: std::time::Instant::now(),
+        });
+    }
+    refresh_login_menu_text(&app, li, &dn);
+    serde_json::json!({ "ok": !li, "loggedIn": li, "cleared": cleared })
+}
+
+/// 弹窗操作按钮回调：前端点击 退出登录/重新登录 等按钮时调用。
+/// action: "logout" → 退出登录后关闭弹窗；"relogin" → 退出登录后打开登录窗口。
+#[tauri::command]
+async fn popup_action(app: tauri::AppHandle, window: WebviewWindow, action: String) {
+    // 先关闭弹窗
+    if window.label() == "popup" {
+        let _ = window.hide();
+    }
+    match action.as_str() {
+        "logout" => {
+            let _ = cnki_logout(app.clone()).await;
+        }
+        "relogin" => {
+            // 先退出当前登录态，再打开登录窗口
+            let _ = cnki_logout(app.clone()).await;
+            open_cnki_login(app);
+        }
+        _ => {}
     }
 }
 
@@ -869,53 +1173,47 @@ async fn cnki_detail_auth(
             };
         }
     };
-    // WebKitGTK 对隐藏 webview 的页面渲染/JS 执行会冻结，导航前必须保证窗口"可见"
-    //（对 GTK 而言 mapped 即可见）。但用户不希望取全文时弹窗打扰 → 用"最小化隐身"：
-    // show + minimize + 不入任务栏 + 不可聚焦。窗口仍映射着（JS 照常执行），但用户
-    // 在任务栏/alt-tab/焦点上都看不到它。若最小化在个别平台导致 JS 冻结（X11 上
-    // 最小化常等价于 unmap），则超时兜底恢复可见继续取——功能不丢，只是退化为现弹窗。
-    let was_hidden = !w.is_visible().unwrap_or(false);
-    let mut stealth = false;
+    // 取全文是后台操作，始终把查询过程页面隐藏起来：最小化（保持窗口映射，
+    // 让 WebKitGTK 继续执行页面 JS）+ 不入任务栏 + 不可聚焦。原先可见的窗口
+    // 结束时还原为可见，原先隐藏的还原为隐藏——避免窗口本来就已显示（如登录
+    // 窗口未被自动隐藏）时，导航/轮询过程整个暴露给用户。
+    let was_visible = w.is_visible().unwrap_or(false);
+    let mut minimized = true;
     // 结束时恢复窗口状态：还原任务栏/焦点属性，取消最小化
-    let restore = |w: &WebviewWindow| {
+    let restore_min = |w: &WebviewWindow| {
         let _ = w.set_skip_taskbar(false);
         let _ = w.set_focusable(true);
         let _ = w.unminimize();
     };
-    if was_hidden {
-        let _ = w.show();
-        let _ = w.set_skip_taskbar(true);
-        let _ = w.set_focusable(false);
-        let _ = w.minimize();
-        stealth = true;
-    }
+    let _ = w.show();
+    let _ = w.set_skip_taskbar(true);
+    let _ = w.set_focusable(false);
+    let _ = w.minimize();
     // 窗口标题改为"条目详情"，避免沿用"CNKI 登录 · 工具书查词"造成误导
     let _ = w.set_title("条目详情 · 工具书查词");
     // 登录时窗口被缩小为登录小窗，看全文时恢复为可展示条目页的尺寸
     let _ = w.set_size(LogicalSize::new(960.0, 720.0));
     if let Err(e) = w.navigate(url) {
-        if was_hidden {
-            restore(&w);
-            let _ = w.hide();
-        }
+        if minimized { restore_min(&w); }
+        if !was_visible { let _ = w.hide(); }
         unlock();
         return cnki::DetailResponse {
             ok: false, content: String::new(),
             error: format!("导航到条目页失败: {e}"),
         };
     }
-    eprintln!("[cnki_detail_auth] navigate ok, fn={fn_}, stealth={stealth}, polling p.image_box...");
+    eprintln!("[cnki_detail_auth] navigate ok, fn={fn_}, minimized={minimized}, polling p.image_box...");
     // 轮询 eval_with_callback 读取 p.image_box 释文（SPA 渲染 + 跳转，最长 ~25s）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-    // 隐身模式下 8s 无结果 → 视为最小化冻结了 JS，恢复可见继续取（保证功能）
-    let stealth_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    // 最小化 8s 无结果 → 视为最小化冻结了 JS，恢复可见继续取（保证功能）
+    let minimized_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let mut silent_polls = 0u32;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if stealth && std::time::Instant::now() > stealth_deadline {
-            stealth = false;
-            restore(&w);
-            eprintln!("[cnki_detail_auth] stealth 8s no result, restored visible to continue");
+        if minimized && std::time::Instant::now() > minimized_deadline {
+            minimized = false;
+            restore_min(&w);
+            eprintln!("[cnki_detail_auth] minimized 8s no result, restored visible to continue");
         }
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let tx2 = tx.clone();
@@ -940,10 +1238,8 @@ async fn cnki_detail_auth(
                             .iter()
                             .any(|p| text.contains(p));
                         if chars > 20 && !is_placeholder {
-                            if was_hidden {
-                                restore(&w);
-                                let _ = w.hide();
-                            }
+                            if minimized { restore_min(&w); }
+                            if !was_visible { let _ = w.hide(); }
                             eprintln!("[cnki_detail_auth] FOUND full text, {} chars", text.len());
                             unlock();
                             return cnki::DetailResponse { ok: true, content: text, error: String::new() };
@@ -961,10 +1257,8 @@ async fn cnki_detail_auth(
         }
         if std::time::Instant::now() > deadline {
             let url_now = w.url().map(|u| u.to_string()).unwrap_or_default();
-            if was_hidden {
-                restore(&w);
-                let _ = w.hide();
-            }
+            if minimized { restore_min(&w); }
+            if !was_visible { let _ = w.hide(); }
             eprintln!("[cnki_detail_auth] TIMEOUT, silent_polls={silent_polls}, url={url_now}");
             unlock();
             return cnki::DetailResponse {
@@ -1015,6 +1309,7 @@ pub fn run() {
             float: Mutex::new(None),
             float_enabled: Mutex::new(true),
             login_cached: Mutex::new(None),
+            login_menu: Mutex::new(None),
             detail_busy: Mutex::new(false),
         })
         .setup(|app| {
@@ -1033,16 +1328,20 @@ pub fn run() {
                             v.get("loggedIn").and_then(|x| x.as_bool()),
                             v.get("error").and_then(|x| x.as_str()),
                         ) {
+                            let dn = v.get("displayName").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let state = app_handle2.state::<AppState>();
                             let mut guard = state.login_cached.lock().unwrap();
                             *guard = Some(LoginCache {
                                 logged_in: li,
                                 error: err.to_string(),
+                                display_name: dn.clone(),
                                 checked_at: std::time::Instant::now(),
                             });
+                            // 预检完成后刷新托盘菜单文字（已登录显示用户名/机构）
+                            refresh_login_menu_text(&app_handle2, li, &dn);
                             eprintln!(
-                                "[startup] cnki login precheck -> logged_in={}, cached",
-                                li
+                                "[startup] cnki login precheck -> logged_in={}, display_name='{}', cached",
+                                li, dn
                             );
                         }
                     });
@@ -1096,6 +1395,8 @@ pub fn run() {
             open_cnki_login,
             cnki_login_status,
             cnki_detail_auth,
+            cnki_logout,
+            popup_action,
             focus_main,
         ])
         .run(tauri::generate_context!())

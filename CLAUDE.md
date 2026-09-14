@@ -66,7 +66,12 @@ No build system. Load `extension/` as an unpacked extension in `chrome://extensi
 
 - **划词选区读取**（`get_selection_text`，Linux）：**Wayland 会话优先 `wl-paste --primary`**（原生应用如 Chrome 的选区走 Wayland 协议，X11 读不到）→ X11 PRIMARY（`x11-clipboard::load`，200ms 超时，避免 `load_wait` 阻塞）→ 剪贴板（先 `wl-paste` 再 arboard）。**Wayland 下 PRIMARY 必须安装 `wl-clipboard`**，否则选区读不到（弹窗会提示"未检测到选中文本"）。`wl-paste` 经 `run_wl_paste` 带 1.5s 超时执行，避免选区所有者无响应卡住主线程。
 - **划词流程**（`trigger_selection_lookup`）：读选区 → 非空则**唤起主窗口**（`show_main` + 向主窗口 emit `main:query`，前端自动填入搜索框并查询）；选区为空则在**提示弹窗**中显示提示（可关闭）。弹窗（440×190，无边框）只承载提示信息，**不再展示查询结果**。
-- **托盘**（`create_tray`）：左键唤起主窗口（非 macOS），菜单 = 显示主窗口 / 划词查询 / **显示悬浮图标**（`CheckMenuItem` 开关，控制悬浮图标是否允许显示）/ 退出。Ctrl+Alt+D 全局快捷键触发划词查询。
+- **托盘**（`create_tray`）：左键唤起主窗口（非 macOS），菜单 = 显示主窗口 / 划词查询 / **CNKI 登录**（动态文字）/ **显示悬浮图标**（`CheckMenuItem` 开关，控制悬浮图标是否允许显示）/ 退出。Ctrl+Alt+D 全局快捷键触发划词查询。
+  - **CNKI 登录菜单项动态文字**（`login_menu` + `refresh_login_menu_text`）：已登录时显示"已登录（用户名/机构）"，未登录显示"CNKI 登录…"。用户身份从 `Ecp_LoginStuts` cookie 的 JSON 值提取（`extract_display_name_from_cookies`，字段 `UserName`/`ShowName`，机构账号用 `BUserName`/`BShowName`；`ShowName` 为通用欢迎语时退回 `UserName`）。
+  - **已登录时点击**：弹信息弹窗（`show_logged_in_popup` → `show_popup_actions`），显示"当前已登录 CNKI\n用户：xxx"，提供 确定/退出登录/重新登录 按钮。前端 `popup:message` 事件支持 `actions` 数组渲染按钮，点击触发 `popup_action` 命令。
+  - **未登录/重新登录时点击**：打开登录窗口（`open_cnki_login`，导航到 `gongjushu.cnki.net/rbook/?tb_login=1`）。登录窗口注入 `CNKI_AUTH_INIT_SCRIPT`：提取 `.login_box_main_container` 登录表单全窗居中显示、加"CNKI 工具书 · 登录"标题条；已登录态下显示"当前已登录"提示而非暴露整页。
+  - **退出登录**（`cnki_logout`）：用 webview 原生 `delete_cookie` 清除 gongjushu 域所有 cookie（含 HttpOnly 会话 cookie，JS `document.cookie` 清不掉），刷新缓存与托盘菜单。
+  - **登录态缓存**（`LoginCache`：`logged_in`/`display_name`/`error`/`checked_at`）：启动预检（setup 后台线程 1.5s 延迟 `check_cnki_login_live`）填充，60s 新鲜度内直接复用；`cnki_login_status` 命令、登录监控、登出都会回填并调 `refresh_login_menu_text`。
 - **悬浮图标**（`create_floating_icon` + `src/float.html`）：56×56 透明置顶小窗。**与主窗口事件联动**：主窗口 `CloseRequested`（关闭隐藏到托盘）→ `show_float_if_enabled` 显示悬浮图标；主窗口 `Focused(true)` 或 `show_main` → `hide_float` 隐藏。受托盘开关（`float_enabled`）约束。**不能用 `data-tauri-drag-region`**（GTK 下 mousedown 即抢占原生拖拽，click 不可靠）；改用 pointer 事件：pointermove 位移 >5px → `invoke('plugin:window|start_dragging')`，pointerup 无位移 → `invoke('focus_main')`。初始定位在主屏右下角。
 - **主窗口图标**：`tauri.conf.json` 的 `bundle.icon` 已全部由 `icons/crfd.svg` 生成（png/icns/ico）。Linux 默认窗口图标取 icon 列表第一个 `.png`（已调整为 128x128）；setup 中再用 `main.set_icon(app.default_window_icon())` 显式设置（非 macOS）。deb 程序列表图标由 bundler 按实际尺寸拷进 hicolor，新构建即生效。
 - 主窗口"关闭"→ 隐藏到托盘；窗口图标、托盘、悬浮图标在同一 `AppState` 管理中。

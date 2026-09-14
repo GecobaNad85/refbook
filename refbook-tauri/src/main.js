@@ -36,19 +36,32 @@ listen('popup:message', (e) => {
     popupInited = true;
   }
   const m = e.payload;
+  const actions = Array.isArray(m.actions) ? m.actions : [];
+  // 多行消息（含 \n）用 white-space: pre-line 渲染；操作按钮横排居中
+  const msgHtml = `<div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}" style="white-space:pre-line;">${esc(m.msg)}</div>`;
+  const actionsHtml = actions.length
+    ? `<div class="tb-popup-actions">${
+        actions.map((a) => `<button class="tb-popup-btn" data-act="${esc(a.id)}">${esc(a.label)}</button>`).join('')
+      }<button class="tb-popup-btn tb-popup-btn-ghost" data-act="close">确定</button></div>`
+    : '';
   popupContainer.innerHTML = `
     <div class="tb-popup">
       <div class="tb-header">
         <span class="tb-title">工具书查词</span>
         <button class="tb-close" data-act="close">×</button>
       </div>
-      <div class="tb-body">
-        <div class="${m.isError ? 'tb-error-msg' : 'tb-loading-msg'}">${esc(m.msg)}</div>
-      </div>
+      <div class="tb-body">${msgHtml}</div>
+      ${actionsHtml}
     </div>`;
   popupContainer.onclick = (e2) => {
-    if (e2.target instanceof Element && e2.target.classList.contains('tb-close')) {
+    if (!(e2.target instanceof Element)) return;
+    const act = e2.target.dataset.act;
+    if (!act) return;
+    if (act === 'close') {
       invoke('popup_close');
+    } else {
+      // 退出登录/重新登录等动作交由后端处理（会先关闭弹窗再执行）
+      invoke('popup_action', { action: act });
     }
   };
 });
@@ -316,11 +329,22 @@ async function toSimplified(text) {
   }
 }
 
-// ---------- 共享：渲染单条结果（与扩展 renderResultItem 一致）----------
-// tab: { keyword, items, fullText, expanded } —— 每个标签独立维护展开状态与全文
-function renderResultItem(item, idx, tab) {
-  const isExpanded = tab.expanded && idx === 0;
+// ---------- 共享：渲染单条结果 ----------
+// 每条结果独立维护展开状态与全文（item._expanded / _fullText / _fetchError），
+// 因此非首条结果也可点击"查看全文"获取并展开自身释文。
+// API 返回的 item 不带这些字段（undefined），需经 normalizeItem 初始化为空值，
+// 否则 `_fullText !== ''` 之类判空会因 undefined 而误判，导致自动取全文永不触发。
+function normalizeItem(item) {
+  item._expanded = false;
+  item._fullText = '';
+  item._fetchError = '';
+  return item;
+}
+function renderResultItem(item, idx) {
+  const isExpanded = !!item._expanded;
   const isFirst = idx === 0;
+  // 能否取全文：cnki_detail_auth 经 readonlineUrl 跳转渲染释文，无 readonlineUrl 则无法取
+  const canFetch = !!item.readonlineUrl;
   let abstractHtml;
   let mayHaveBtn = false;
   let btnText = '查看全文';
@@ -328,12 +352,12 @@ function renderResultItem(item, idx, tab) {
   if (!isExpanded) {
     const maxChars = isFirst ? 500 : 200;
     abstractHtml = esc(truncate(item.abstract || '', maxChars));
-    mayHaveBtn = isFirst && item.fn ? true : false;
+    mayHaveBtn = canFetch;
   } else {
-    // 已展开且是首条：使用完整释文（如果已获取到）或摘要兜底
-    const fullTextLoaded = tab.fullText !== '';
-    const loading = tab.fetchError === '加载中…';
-    const displayText = fullTextLoaded ? tab.fullText : (item.abstract || '');
+    // 已展开：使用完整释文（如果已获取到）或摘要兜底
+    const fullTextLoaded = item._fullText !== '';
+    const loading = item._fetchError === '加载中…';
+    const displayText = fullTextLoaded ? item._fullText : (item.abstract || '');
     if (displayText) {
       if (displayText.length > 500) {
         abstractHtml = esc(truncate(displayText, 500))
@@ -342,24 +366,24 @@ function renderResultItem(item, idx, tab) {
         abstractHtml = esc(displayText);
       }
       // 全文未成功获取（仅以摘要兜底展示）时保留"查看全文"按钮供重试
-      if (isFirst && item.fn && !fullTextLoaded) {
+      if (canFetch && !fullTextLoaded) {
         mayHaveBtn = true;
         if (loading) {
           btnText = '加载中…';
           abstractHtml += '<div style="color:#999;font-size:12px;margin-top:4px;">正在获取全文…</div>';
-        } else if (tab.fetchError) {
-          abstractHtml += `<div style="color:#b94a48;font-size:12px;margin-top:4px;">${esc(tab.fetchError)}，可点击下方按钮重试</div>`;
+        } else if (item._fetchError) {
+          abstractHtml += `<div style="color:#b94a48;font-size:12px;margin-top:4px;">${esc(item._fetchError)}，可点击下方按钮重试</div>`;
         }
       }
     } else if (loading) {
       abstractHtml = '<span style="color:#999;font-size:12px;">正在获取全文…</span>';
-      mayHaveBtn = isFirst && item.fn;
+      mayHaveBtn = canFetch;
       btnText = '加载中…';
     } else {
       // 全文和摘要均为空，显示提示并保留"查看全文"按钮
-      const err = tab.fetchError ? esc(tab.fetchError) : '获取释文失败';
+      const err = item._fetchError ? esc(item._fetchError) : '获取释文失败';
       abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" data-act="login">点此登录 CNKI</a> 后重试</span>`;
-      mayHaveBtn = true;
+      mayHaveBtn = canFetch;
     }
   }
 
@@ -372,7 +396,7 @@ function renderResultItem(item, idx, tab) {
     <div class="tb-result ${idx > 0 ? 'tb-result-border' : ''}">
       <div class="tb-word">${esc(item.title)}</div>
       <div class="tb-abstract">${abstractHtml}</div>
-      ${mayHaveBtn ? `<button class="tb-fulltext-btn">${btnText}</button>` : ''}
+      ${mayHaveBtn ? `<button class="tb-fulltext-btn" data-idx="${idx}">${btnText}</button>` : ''}
       <div class="tb-source">来源：${bookLinkHtml}</div>
       <div class="tb-meta">
         ${item.subject ? `<span class="tb-tag">${esc(item.subject)}</span>` : ''}
@@ -404,12 +428,15 @@ function initMain() {
   invoke('cnki_ping').then((ok) => { statusDot.className = 'status ' + (ok ? 'ok' : 'bad'); })
     .catch(() => { statusDot.className = 'status bad'; });
 
-  // 标签状态（移植扩展 tabState）：整词命中为单标签（不显示标签头）；分词命中为多标签
-  let tabs = [];          // [{ keyword, items, fullText, expanded }]
+  // 标签状态：每个 tab 含 { keyword, items }；items 各自带 _expanded/_fullText/_fetchError
+  let tabs = [];          // [{ keyword, items }]
   let activeIndex = 0;
   let currentKeyword = '';
   // 搜索代数：作废过期异步回调
   let generation = 0;
+  // 取全文串行锁：cnki_detail_auth 在 Rust 侧有独占锁（detail_busy），并发调用会被拒。
+  // 此标志在前端先拦一道，避免点击不同条目的"查看全文"时第二个拿到"正在获取其他条目"报错。
+  let fetchInProgress = false;
 
   function setLoading(msg) {
     resultsEl.innerHTML = '<div class="main-loading"><span class="tb-spinner"></span> ' + esc(msg) + '</div>';
@@ -441,7 +468,7 @@ function initMain() {
     if (!tab || tab.items.length === 0) {
       html += '<div class="main-empty">该分词未命中结果</div>';
     } else {
-      html += tab.items.map((item, idx) => renderResultItem(item, idx, tab)).join('');
+      html += tab.items.map((item, idx) => renderResultItem(item, idx)).join('');
     }
     resultsEl.innerHTML = html;
   }
@@ -456,7 +483,10 @@ function initMain() {
       autoFetchActive(generation);
       return;
     }
-    if (e.target.classList.contains('tb-fulltext-btn')) { onFullText(); return; }
+    if (e.target.classList.contains('tb-fulltext-btn')) {
+      onFullText(Number(e.target.dataset.idx));
+      return;
+    }
     const toggle = e.target.closest('.tb-expand-toggle');
     if (toggle) { onExpand(toggle); return; }
     const loginLink = e.target.closest('[data-act="login"]');
@@ -483,7 +513,7 @@ function initMain() {
     const data = j.results || [];
     if (data.length > 0) {
       // 整词命中：单标签，不显示标签头
-      tabs = [{ keyword, items: data, fullText: '', expanded: false, fetchError: '' }];
+      tabs = [{ keyword, items: data.map(normalizeItem) }];
       activeIndex = 0;
       currentKeyword = keyword;
       render();
@@ -517,8 +547,8 @@ function initMain() {
 
     // 构建标签：[原词(空)] + 各命中分词
     tabs = [
-      { keyword, items: [], fullText: '', expanded: false, fetchError: '' },
-      ...selected.map((r) => ({ keyword: r.seg.text, items: r.results, fullText: '', expanded: false, fetchError: '' })),
+      { keyword, items: [] },
+      ...selected.map((r) => ({ keyword: r.seg.text, items: r.results.map(normalizeItem) })),
     ];
     activeIndex = 1; // 第一个有结果的分词标签
     currentKeyword = keyword;
@@ -547,21 +577,33 @@ function initMain() {
     const tab = tabs[activeIndex];
     if (!tab || tab.items.length === 0) return;
     const first = tab.items[0];
-    if (!first.fn || tab.fullText !== '' || tab.expanded) return;
-    tab.expanded = true;
-    fetchFullText(tab, first, gen);
+    // 完整性判断：仅当首条具备 readonlineUrl（可经详情页跳转渲染全文）且尚未展开时
+    // 才自动获取。fn 不足以判定——cnki_detail_auth 必须靠 readonlineUrl 跳转，
+    // 缺失时只会返回"该条目没有跳转链接"报错，污染首条展示。
+    if (!first.readonlineUrl || first._expanded || first._fullText !== '') return;
+    fetchFullText(first, gen);
   }
-  function onFullText() {
+  function onFullText(idx) {
     const tab = tabs[activeIndex];
     if (!tab) return;
-    if (tab.fetchError === '加载中…') return; // 正在获取，忽略重复点击
-    tab.expanded = true;
-    fetchFullText(tab, tab.items[0], generation);
+    const item = tab.items[idx];
+    if (!item) return; // idx 越界/NaN 时安全 no-op
+    if (item._fetchError === '加载中…') return; // 本条正在获取，忽略重复点击
+    fetchFullText(item, generation);
   }
-  async function fetchFullText(tab, item, gen) {
-    tab.expanded = true;
-    tab.fullText = '';
-    tab.fetchError = '加载中…';
+  async function fetchFullText(item, gen) {
+    // 串行锁：Rust 侧 detail_busy 同一时刻只允许一个取全文任务，前端先拦并发
+    if (fetchInProgress) {
+      item._expanded = true;
+      item._fetchError = '正在获取其他条目全文，请稍候重试';
+      render();
+      return;
+    }
+    fetchInProgress = true;
+    // 状态转移统一在此完成，调用方不再预置 _expanded
+    item._expanded = true;
+    item._fullText = '';
+    item._fetchError = '加载中…';
     render();
     try {
       // 先检查登录态：已登录静默走详情页流程；未登录只提示去登录，
@@ -569,8 +611,8 @@ function initMain() {
       const st = await invoke('cnki_login_status');
       if (gen !== generation) return;
       if (!st.loggedIn) {
-        tab.fullText = '';
-        tab.fetchError = st.error || '未登录 CNKI，请先在托盘菜单点击"CNKI 登录…"';
+        item._fullText = '';
+        item._fetchError = st.error || '未登录 CNKI，请先在托盘菜单点击"CNKI 登录…"';
         render();
         return;
       }
@@ -586,13 +628,15 @@ function initMain() {
         readonlineUrl: item.readonlineUrl || '',
       });
       if (gen !== generation) return;
-      tab.fullText = d.ok ? d.content : '';
-      tab.fetchError = d.ok ? '' : (d.error || '获取释文失败');
+      item._fullText = d.ok ? d.content : '';
+      item._fetchError = d.ok ? '' : (d.error || '获取释文失败');
       render();
     } catch (e) {
       if (gen !== generation) return;
-      tab.fetchError = '请求出错：' + String(e);
+      item._fetchError = '请求出错：' + String(e);
       render();
+    } finally {
+      fetchInProgress = false;
     }
   }
   function onExpand(toggle) {
