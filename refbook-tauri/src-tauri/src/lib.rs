@@ -1033,16 +1033,36 @@ fn open_cnki_login(app: tauri::AppHandle) {
 
 /// 退出 CNKI 登录：用 webview 原生 delete_cookie 清除 gongjushu 域所有 cookie
 ///（含 HttpOnly 会话 cookie，JS document.cookie 清不掉），再刷新缓存与托盘菜单。
+///
+/// cookie 删除与复检必须在主线程执行——GTK/webview 的 cookies_for_url、delete_cookie
+/// 从 worker 线程调用会静默失效（cookie 没真删，复检仍读到旧会话 → 托盘仍显示已登录）。
+/// 故用 run_on_main_thread + oneshot 通道把整个删除+复检+刷新托盘流程切回主线程。
 #[tauri::command]
 async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let app_h = app.clone();
+    let res = app.run_on_main_thread(move || {
+        let result = perform_logout_and_refresh(&app_h);
+        let _ = tx.send(result);
+    });
+    if res.is_err() {
+        return serde_json::json!({ "ok": false, "error": "无法切回主线程执行登出" });
+    }
+    // run_on_main_thread 是 fire-and-forget；等待 oneshot 取回结果（主线程执行完即就绪）
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(v)) => v,
+        _ => serde_json::json!({ "ok": false, "error": "登出超时" }),
+    }
+}
+
+/// 在主线程上执行 cookie 清除 + 复检 + 刷新缓存与托盘菜单，返回结果 JSON。
+/// 调用者须保证在主线程调用（GTK webview cookie API 非主线程会静默失效）。
+fn perform_logout_and_refresh(app: &AppHandle) -> serde_json::Value {
     let w = match app.get_webview_window("cnki-auth") {
         Some(w) => w,
-        None => {
-            return serde_json::json!({ "ok": false, "error": "登录窗口未初始化" });
-        }
+        None => return serde_json::json!({ "ok": false, "error": "登录窗口未初始化" }),
     };
     let url: tauri::Url = "https://gongjushu.cnki.net/".parse().unwrap();
-    // 读出当前所有 gongjushu 域 cookie，逐个 delete_cookie 清除（原生 API 能清 HttpOnly）
     let cleared = match w.cookies_for_url(url) {
         Ok(cookies) => {
             let n = cookies.len();
@@ -1057,10 +1077,9 @@ async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
             0
         }
     };
-    // delete_cookie 不保证立即生效，短暂等待后复检
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    // 刷新缓存与托盘菜单
-    let live = check_cnki_login_live(&app);
+    // delete_cookie 不保证立即生效，但此处不阻塞主线程等待——直接复检，
+    // 即便读到旧值，后续托盘菜单点击的后台刷新会再校正一次。
+    let live = check_cnki_login_live(app);
     let li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
     let dn = live.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
     {
@@ -1073,7 +1092,7 @@ async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
             checked_at: std::time::Instant::now(),
         });
     }
-    refresh_login_menu_text(&app, li, &dn);
+    refresh_login_menu_text(app, li, &dn);
     serde_json::json!({ "ok": !li, "loggedIn": li, "cleared": cleared })
 }
 
