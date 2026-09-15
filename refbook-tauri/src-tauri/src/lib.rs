@@ -693,19 +693,40 @@ const CNKI_AUTH_INIT_SCRIPT: &str = r#"
           if ((btns[i].textContent || '').trim() === '登录') { loginTab = btns[i]; break; }
         }
         if (!loginTab) {
-          // 已登录或无登录入口：在登录小窗中显示"已登录"提示，而非暴露整个 gongjushu 页面
-          clearInterval(timer);
-          try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
-          var notice = document.createElement('div');
-          notice.textContent = '当前已登录 CNKI，可关闭此窗口。如需切换账号，请先退出登录再重新打开登录。';
-          notice.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-size:15px;color:#333;line-height:1.8;padding:24px 32px;background:#fff;border-radius:8px;box-shadow:0 2px 16px rgba(0,0,0,0.1);z-index:999999;max-width:80%;';
-          Array.prototype.forEach.call(document.body.children, function (el) {
-            if (el.tagName === 'SCRIPT' || el.tagName === 'NOSCRIPT') return;
-            el.style.display = 'none';
-          });
-          document.body.appendChild(notice);
+          // 区分"真已登录"与"顶栏渲染失败"：读实际会话 cookie（Ecp_LoginStuts 为
+          // JS 可读 cookie，toplogin 脚本自己也用它判断登录态）。顶栏脚本跨域加载
+          // （login.cnki.net/toploginnew），偶发加载失败/慢时 tab 缺失，若不区分
+          // 会误报"当前已登录"。
+          var stuts = /(?:^|;\s*)Ecp_LoginStuts=/.test(document.cookie || '');
+          if (stuts) {
+            clearInterval(timer);
+            try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+            var notice = document.createElement('div');
+            notice.textContent = '当前已登录 CNKI，可关闭此窗口。如需切换账号，请先退出登录再重新打开登录。';
+            notice.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;font-size:15px;color:#333;line-height:1.8;padding:24px 32px;background:#fff;border-radius:8px;box-shadow:0 2px 16px rgba(0,0,0,0.1);z-index:999999;max-width:80%;';
+            Array.prototype.forEach.call(document.body.children, function (el) {
+              if (el.tagName === 'SCRIPT' || el.tagName === 'NOSCRIPT') return;
+              el.style.display = 'none';
+            });
+            document.body.appendChild(notice);
+            return;
+          }
+          // 未登录但顶栏没渲染出登录入口：先等 ~5s 再重载（顶栏由跨域 toplogin
+          // 脚本渲染，加载慢是常态，冷缓存下远超首个 200ms tick，不能立刻 reload）。
+          // 只重载一次重试（toplogin 脚本加载失败通常重载即恢复）；用带时间戳的
+          // sessionStorage 标志防止无限重载循环，标志 60s 后自动过期——不会因一次
+          // 彻底失败就永久失去重试机会。重载过仍无入口则不再干预，保留原页面
+          // （用户可手动点页面上"登录"）。
+          var lastReload = 0;
+          try { lastReload = parseInt(sessionStorage.getItem('tbLoginReloadedAt') || '0', 10) || 0; } catch (_) {}
+          if (tries >= 25 && Date.now() - lastReload > 60000) {
+            try { sessionStorage.setItem('tbLoginReloadedAt', String(Date.now())); } catch (_) {}
+            clearInterval(timer);
+            location.reload();
+          }
           return;
         }
+        try { sessionStorage.removeItem('tbLoginReloadedAt'); } catch (_) {}
         try { if (!loginTab.dataset.tbClicked) { loginTab.dataset.tbClicked = '1'; loginTab.click(); } } catch (_) {}
         // 等登录表单渲染完成（用户名输入框存在且容器有尺寸）
         var box = document.querySelector('.login_box_main_container');
@@ -971,6 +992,11 @@ fn cnki_login_status(app: tauri::AppHandle) -> serde_json::Value {
 #[tauri::command]
 fn open_cnki_login(app: tauri::AppHandle) {
     if let Some(w) = get_or_create_cnki_auth(&app) {
+        // 防御性恢复窗口状态：该窗口可能刚被"退出登录"流程最小化+skip_taskbar+
+        // 不可聚焦过（cnki_logout），残留状态会导致窗口无法聚焦/难以关闭。
+        let _ = w.unminimize();
+        let _ = w.set_skip_taskbar(false);
+        let _ = w.set_focusable(true);
         // 仅登录小窗：登录表单自然宽约 360px、高约 400px，窗口略大留出边距
         let _ = w.set_size(LogicalSize::new(460.0, 500.0));
         let _ = w.set_resizable(true);
@@ -1031,69 +1057,209 @@ fn open_cnki_login(app: tauri::AppHandle) {
     }
 }
 
-/// 退出 CNKI 登录：用 webview 原生 delete_cookie 清除 gongjushu 域所有 cookie
-///（含 HttpOnly 会话 cookie，JS document.cookie 清不掉），再刷新缓存与托盘菜单。
+/// 退出 CNKI 登录：在 cnki-auth webview 内调用页面自带的 Ecp_LogoutOptr_my(0)
+/// （即页头"退出"按钮的逻辑）。它向 login.cnki.net/TopLoginCore/api/loginapi/Logout
+/// 发同步 ajax（带 createSign 签名 + withCredentials），服务端使会话失效并通过
+/// Set-Cookie 过期 HttpOnly 会话 cookie（Ecp_session 等），其 success/complete 回调
+/// 再用 JS 清掉 Ecp_LoginStuts 等可访问 cookie。
 ///
-/// cookie 删除与复检必须在主线程执行——GTK/webview 的 cookies_for_url、delete_cookie
-/// 从 worker 线程调用会静默失效（cookie 没真删，复检仍读到旧会话 → 托盘仍显示已登录）。
-/// 故用 run_on_main_thread + oneshot 通道把整个删除+复检+刷新托盘流程切回主线程。
+/// 这条路是唯一能真正清掉 HttpOnly 会话 cookie 的方式——此前仅靠 delete_cookie +
+/// 销毁 webview，但 Tauri/wry 的 cookie 罐是持久化落盘的共享罐，销毁窗口不会清掉
+/// 已落盘的 cookie，复检仍读到旧会话 → 托盘仍显示已登录。调完页面登出后再复检；
+/// 若仍残留（接口未过期某些 HttpOnly cookie），再 delete_cookie 兜底清一遍。
 #[tauri::command]
 async fn cnki_logout(app: tauri::AppHandle) -> serde_json::Value {
-    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-    let app_h = app.clone();
-    let res = app.run_on_main_thread(move || {
-        let result = perform_logout_and_refresh(&app_h);
-        let _ = tx.send(result);
-    });
-    if res.is_err() {
-        return serde_json::json!({ "ok": false, "error": "无法切回主线程执行登出" });
-    }
-    // run_on_main_thread 是 fire-and-forget；等待 oneshot 取回结果（主线程执行完即就绪）
-    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-        Ok(Ok(v)) => v,
-        _ => serde_json::json!({ "ok": false, "error": "登出超时" }),
-    }
-}
-
-/// 在主线程上执行 cookie 清除 + 复检 + 刷新缓存与托盘菜单，返回结果 JSON。
-/// 调用者须保证在主线程调用（GTK webview cookie API 非主线程会静默失效）。
-fn perform_logout_and_refresh(app: &AppHandle) -> serde_json::Value {
-    let w = match app.get_webview_window("cnki-auth") {
-        Some(w) => w,
-        None => return serde_json::json!({ "ok": false, "error": "登录窗口未初始化" }),
-    };
-    let url: tauri::Url = "https://gongjushu.cnki.net/".parse().unwrap();
-    let cleared = match w.cookies_for_url(url) {
-        Ok(cookies) => {
-            let n = cookies.len();
-            for c in &cookies {
-                let _ = w.delete_cookie(c.clone());
-            }
-            eprintln!("[cnki_logout] cleared {n} cookies");
-            n
-        }
-        Err(e) => {
-            eprintln!("[cnki_logout] cookies_for_url error: {e}");
-            0
-        }
-    };
-    // delete_cookie 不保证立即生效，但此处不阻塞主线程等待——直接复检，
-    // 即便读到旧值，后续托盘菜单点击的后台刷新会再校正一次。
-    let live = check_cnki_login_live(app);
-    let li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
-    let dn = live.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // 独占锁：与 cnki_detail_auth 互斥。登出会导航共享的 cnki-auth 窗口并跑 eval
+    // 轮询，若与取全文并发，导航会把对方轮询中的页面拽走、cookie 清扫会删掉对方
+    // 还要用的会话 cookie，两边都失败。
     {
         let state = app.state::<AppState>();
+        let mut busy = state.detail_busy.lock().unwrap();
+        if *busy {
+            return serde_json::json!({ "ok": false, "error": "正在获取条目全文，请等取全文完成后再退出登录" });
+        }
+        *busy = true;
+    }
+    let app_for_unlock = app.clone();
+    let unlock = || {
+        let state = app_for_unlock.state::<AppState>();
+        *state.detail_busy.lock().unwrap() = false;
+    };
+
+    // 1. 确保 cnki-auth 窗口存在（窗口创建须在主线程）
+    let w = match ensure_cnki_auth_window(&app).await {
+        Some(w) => w,
+        None => {
+            unlock();
+            return serde_json::json!({ "ok": false, "error": "无法创建 CNKI 登录窗口" });
+        }
+    };
+
+    // 2. 显示+最小化窗口（不入任务栏、不可聚焦），保证 WebKitGTK 执行页面 JS。
+    //    与 cnki_detail_auth 同套做法：最小化在前 8s 内仍跑 JS，足够同步登出 ajax 完成。
+    let was_visible = w.is_visible().unwrap_or(false);
+    let _ = w.show();
+    let _ = w.set_skip_taskbar(true);
+    let _ = w.set_focusable(false);
+    let _ = w.minimize();
+    let _ = w.set_title("CNKI 登录 · 工具书查词");
+    // 导航到 gongjushu 首页：加载 toplogin 脚本，提供 Ecp_LogoutOptr_my
+    let nav_url: tauri::Url = "https://gongjushu.cnki.net/rbook/".parse().unwrap();
+    if let Err(e) = w.navigate(nav_url) {
+        restore_auth_window(&w, was_visible);
+        unlock();
+        return serde_json::json!({ "ok": false, "error": format!("导航失败: {e}") });
+    }
+
+    // 3. 轮询：等 Ecp_LogoutOptr_my 就绪后调一次（其内部 async:false ajax 同步完成）。
+    //    单条 eval 兼顾"等待就绪"+"触发登出"：未就绪返 waiting，就绪则同步执行后返 done。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut js_ok = false;
+    let mut done = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        if w.eval_with_callback(CNKI_EVAL_LOGOUT, move |res| { let _ = tx.send(res); }).is_err() {
+            continue;
+        }
+        // 同步登出 ajax 可能阻塞 JS 线程数秒，recv 给足 8s
+        match rx.recv_timeout(std::time::Duration::from_millis(8000)) {
+            Ok(raw) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    match v.get("stage").and_then(|x| x.as_str()).unwrap_or("") {
+                        "done" => {
+                            js_ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                            done = true;
+                            break;
+                        }
+                        "err" => {
+                            eprintln!("[cnki_logout] eval err: {:?}", v.get("error"));
+                            break;
+                        }
+                        _ => { /* waiting / kicked → 继续轮询 */ }
+                    }
+                }
+            }
+            Err(_) => { /* JS 线程阻塞在同步 ajax 中或回调未触发，继续轮询 */ }
+        }
+    }
+    eprintln!("[cnki_logout] js logout done={done}, js_ok={js_ok}");
+
+    // 4. 恢复窗口可见性
+    restore_auth_window(&w, was_visible);
+
+    // 5. 复检登录态 + 兜底清 cookie + 刷新缓存与托盘菜单。
+    //    cookie 操作须主线程（cookies_for_url/delete_cookie），但等待（Set-Cookie
+    //    落定、destroy 排队落地）全部用 async sleep 留在异步线程，不冻结 GTK 主线程。
+    // 等 Set-Cookie 在 cookie 罐里落定（异步线程等待，不占主线程）
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut live = check_login_on_main(&app).await;
+    let mut li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // 服务端登出仍残留（HttpOnly cookie 未被过期等）→ 兜底：delete_cookie 逐个清
+    // + 销毁窗口，等销毁落地后重建再复检
+    let mut swept = false;
+    if li {
+        swept = sweep_and_destroy_auth(&app).await;
+        // destroy 经事件循环代理排队，在闭包返回后才落地；先在异步线程等它处理完，
+        // 之后 ensure_cnki_auth_window 才会真正重建新窗口（否则 get_webview_window
+        // 仍返回已判死的旧窗口，复检也读到 teardown 中的 webview）。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = ensure_cnki_auth_window(&app).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        live = check_login_on_main(&app).await;
+        li = live.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    }
+    eprintln!("[cnki_logout] js_ok={js_ok}, swept={swept}, recheck logged_in={li}");
+
+    let dn = live.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let error = live.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    {
+        let state = app.state::<AppState>();
+        *state.detail_busy.lock().unwrap() = false;
         let mut guard = state.login_cached.lock().unwrap();
         *guard = Some(LoginCache {
             logged_in: li,
-            error: live.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            error,
             display_name: dn.clone(),
             checked_at: std::time::Instant::now(),
         });
     }
-    refresh_login_menu_text(app, li, &dn);
-    serde_json::json!({ "ok": !li, "loggedIn": li, "cleared": cleared })
+    refresh_login_menu_text(&app, li, &dn);
+    serde_json::json!({ "ok": !li, "loggedIn": li, "jsLogout": js_ok, "swept": swept })
+}
+
+/// 在主线程上获取（必要时创建）cnki-auth 窗口。窗口创建是 webview 操作，须主线程。
+async fn ensure_cnki_auth_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("cnki-auth") {
+        return Some(w);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<WebviewWindow>>();
+    let app_h = app.clone();
+    if app.run_on_main_thread(move || {
+        let w = get_or_create_cnki_auth(&app_h);
+        let _ = tx.send(w);
+    }).is_err() {
+        return None;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(w)) => w,
+        _ => None,
+    }
+}
+
+/// 恢复 cnki-auth 窗口的最小化/任务栏/焦点状态，并按原先是否可见决定隐藏。
+fn restore_auth_window(w: &WebviewWindow, was_visible: bool) {
+    let _ = w.set_skip_taskbar(false);
+    let _ = w.set_focusable(true);
+    let _ = w.unminimize();
+    if !was_visible {
+        let _ = w.hide();
+    }
+}
+
+/// 在主线程上执行 check_cnki_login_live（cookie 读取须主线程），异步等待结果。
+async fn check_login_on_main(app: &AppHandle) -> serde_json::Value {
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let app_h = app.clone();
+    if app.run_on_main_thread(move || {
+        let _ = tx.send(check_cnki_login_live(&app_h));
+    }).is_err() {
+        return serde_json::json!({ "loggedIn": false, "error": "无法切回主线程读取登录状态" });
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(v)) => v,
+        _ => serde_json::json!({ "loggedIn": false, "error": "读取登录状态超时" }),
+    }
+}
+
+/// 登出兜底（须主线程执行）：delete_cookie 逐个清 gongjushu cookie，再销毁
+/// cnki-auth 窗口。destroy 经事件循环代理排队、在闭包返回后才落地，因此不复检、
+/// 不在此处重建窗口——由调用方等待落地后经 ensure_cnki_auth_window 重建再复检。
+/// 返回是否执行了 cookie 清扫。
+async fn sweep_and_destroy_auth(app: &AppHandle) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    let app_h = app.clone();
+    if app.run_on_main_thread(move || {
+        let mut swept = false;
+        if let Some(w) = app_h.get_webview_window("cnki-auth") {
+            let url: tauri::Url = "https://gongjushu.cnki.net/".parse().unwrap();
+            if let Ok(cookies) = w.cookies_for_url(url) {
+                for c in &cookies {
+                    let _ = w.delete_cookie(c.clone());
+                }
+                swept = true;
+            }
+            let _ = w.destroy();
+        }
+        let _ = tx.send(swept);
+    }).is_err() {
+        return false;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(s)) => s,
+        _ => false,
+    }
 }
 
 /// 查询条目全文（桌面版主路径）：在 cnki-auth webview 内导航到条目的跳转链接
@@ -1310,6 +1476,24 @@ const CNKI_EVAL_EXTRACT: &str = r#"(function () {
     }
   } catch (_) {}
   return { exists: false, text: '' };
+})()"#;
+
+/// 触发 CNKI 页面自带登出：调用 Ecp_LogoutOptr_my(0)（页头"退出"按钮的逻辑）。
+/// 其内部 $.ajax({async:false}) 同步调 login.cnki.net Logout 接口，完成时回调清
+/// Ecp_LoginStuts 等 cookie。本 eval 兼顾"等待就绪"与"执行登出"：
+///   - 脚本未加载（Ecp_LogoutOptr_my 未定义）→ 返 {stage:"waiting"}，继续轮询
+///   - 首次就绪 → 同步执行登出后返 {stage:"done", ok:true}
+///   - 执行抛异常 → 返 {stage:"done", ok:false, error:...}
+/// 因 ajax 为同步，eval 回调会在登出完成后才触发（JS 线程阻塞至 ajax 返回）。
+const CNKI_EVAL_LOGOUT: &str = r#"(function () {
+  try {
+    if (typeof Ecp_LogoutOptr_my !== 'function') return { stage: 'waiting' };
+    if (!window.__cnkiLogoutDone) {
+      try { Ecp_LogoutOptr_my(0); window.__cnkiLogoutDone = true; }
+      catch (e) { return { stage: 'done', ok: false, error: String(e) }; }
+    }
+    return { stage: 'done', ok: true, cookie: (document.cookie || '').slice(0, 150) };
+  } catch (e) { return { stage: 'err', error: String(e) }; }
 })()"#;
 
 fn urlencode(s: &str) -> String {
