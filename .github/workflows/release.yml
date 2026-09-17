@@ -18,7 +18,7 @@ jobs:
       release_body: ${{ steps.tag.outputs.message }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Get version
         id: get_version
@@ -63,7 +63,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Get version
         id: get_version
