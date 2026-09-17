@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Tauri 后端 Rust 依赖
+  - package-ecosystem: "cargo"
+    directory: "/refbook-tauri/src-tauri"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # Tauri v2 依赖 gtk-rs 0.18 代（gtk 0.18 → glib 0.18），
+      # glib 0.20+（安全通告要求的最低修复版本）在当前依赖树中无法解析，
+      # 忽略跨大版本升级，等待 Tauri 迁移到 gtk-rs 0.20 后再放开。
+      - dependency-name: "glib"
+        update-types: ["version-update:semver-major"]
+
+  # Tauri 前端工具链（@tauri-apps/cli）
+  - package-ecosystem: "npm"
+    directory: "/refbook-tauri"
+    schedule:
+      interval: "weekly"
+
+  # Electron 桌面版原型
+  - package-ecosystem: "npm"
+    directory: "/refbook-desktop"
+    schedule:
+      interval: "weekly"
+
+  # GitHub Actions 工作流
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
