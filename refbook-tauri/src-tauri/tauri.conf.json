@@ -14,6 +14,9 @@
         "title": "工具书查词 · 桌面版",
         "width": 880,
         "height": 640,
+        "minWidth": 640,
+        "minHeight": 480,
+        "center": true,
         "decorations": false
       }
     ],

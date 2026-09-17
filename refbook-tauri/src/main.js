@@ -358,7 +358,7 @@ function renderResultItem(item, idx) {
     if (displayText) {
       if (displayText.length > 500) {
         abstractHtml = esc(truncate(displayText, 500))
-          + `<span class="tb-expand-toggle" data-raw="${encodeURIComponent(displayText)}">展开</span>`;
+          + `<span class="tb-expand-toggle" role="button" tabindex="0" data-raw="${encodeURIComponent(displayText)}">展开</span>`;
       } else {
         abstractHtml = esc(displayText);
       }
@@ -379,18 +379,18 @@ function renderResultItem(item, idx) {
     } else {
       // 全文和摘要均为空，显示提示并保留"查看全文"按钮
       const err = item._fetchError ? esc(item._fetchError) : '获取释文失败';
-      abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" data-act="login">点此登录 CNKI</a> 后重试</span>`;
+      abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" role="link" tabindex="0" data-act="login">点此登录 CNKI</a> 后重试</span>`;
       mayHaveBtn = canFetch;
     }
   }
 
   const entryUrl = getBookEntryUrl(item);
   const bookLinkHtml = entryUrl
-    ? `<a class="tb-book-link" data-url="${esc(entryUrl)}">《${esc(item.bookName)}》</a>`
+    ? `<a class="tb-book-link" role="link" tabindex="0" data-url="${esc(entryUrl)}">《${esc(item.bookName)}》</a>`
     : `《${esc(item.bookName)}》`;
 
   return `
-    <div class="tb-result ${idx > 0 ? 'tb-result-border' : ''}">
+    <div class="tb-result">
       <div class="tb-word">${esc(item.title)}</div>
       <div class="tb-abstract">${abstractHtml}</div>
       ${mayHaveBtn ? `<button class="tb-fulltext-btn" data-idx="${idx}">${btnText}</button>` : ''}
@@ -406,11 +406,24 @@ function renderResultItem(item, idx) {
 // 主窗口
 // ============================================================
 function initMain() {
-  document.getElementById('main-view').hidden = false;
   const input = document.getElementById('word-input');
   const searchBtn = document.getElementById('search-btn');
   const resultsEl = document.getElementById('results');
   const statusDot = document.getElementById('status-dot');
+
+  // 连接状态点：绿 = 可达 CNKI API；查询级失败（网络/服务不可用）时联动变红
+  function setStatus(ok) { statusDot.className = 'status ' + (ok ? 'ok' : 'bad'); }
+
+  // 首次启动的引导空态（发起查询后即被 loading/结果替换）
+  function renderWelcome() {
+    resultsEl.innerHTML = `
+      <div class="main-welcome">
+        <img class="welcome-logo" src="/assets/crfd.svg" alt="" />
+        <div class="welcome-title">在上方输入词目开始查询，或在任意页面选中文字后按 <b>Ctrl+Alt+D</b></div>
+        <div class="welcome-sub">整词未命中时自动分词检索；繁体词目自动转简体兜底；多分词结果以标签切换查看</div>
+      </div>`;
+  }
+  renderWelcome();
 
   initWindowControls();
 
@@ -422,8 +435,7 @@ function initMain() {
     doLookup(word);
   });
 
-  invoke('cnki_ping').then((ok) => { statusDot.className = 'status ' + (ok ? 'ok' : 'bad'); })
-    .catch(() => { statusDot.className = 'status bad'; });
+  invoke('cnki_ping').then(setStatus).catch(() => setStatus(false));
 
   // 标签状态：每个 tab 含 { keyword, items }；items 各自带 _expanded/_fullText/_fetchError
   let tabs = [];          // [{ keyword, items }]
@@ -451,13 +463,13 @@ function initMain() {
     const showTabs = tabs.length > 1;
     let html = '';
     if (showTabs) {
-      html += '<div class="tb-tabs">';
+      html += '<div class="tb-tabs" role="tablist">';
       tabs.forEach((t, i) => {
         // 原词标签（index 0）即使无结果也显示；分词标签只显示有结果的
         if (i !== 0 && t.items.length === 0) return;
         const cls = i === activeIndex ? 'tb-tab active' : 'tb-tab';
         const cnt = t.items.length > 0 ? `<span class="tb-tab-count">${t.items.length}</span>` : '';
-        html += `<div class="${cls}" data-tab="${i}">${esc(t.keyword)}${cnt}</div>`;
+        html += `<div class="${cls}" role="tab" tabindex="0" aria-selected="${i === activeIndex}" data-tab="${i}">${esc(t.keyword)}${cnt}</div>`;
       });
       html += '</div>';
     }
@@ -492,6 +504,17 @@ function initMain() {
     if (bookLink && bookLink.dataset.url) { invoke('open_entry_url', { url: bookLink.dataset.url }); return; }
   };
 
+  // 键盘可操作性：tab/展开收起/来源与登录链接均为非原生元素，Enter/空格等同点击
+  resultsEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.closest('.tb-tab, .tb-expand-toggle, .tb-book-link, [data-act="login"]')) {
+      e.preventDefault();
+      t.click();
+    }
+  });
+
   // ---------- 查询链（移植扩展 runQueryChain / queryWithSegmentation）----------
   // 返回 true 表示已渲染（含错误/空），不再兜底；false 表示整链无结果，可继续繁→简兜底
   async function runQueryChain(keyword, gen) {
@@ -501,10 +524,14 @@ function initMain() {
       j = await invoke('cnki_search', { word: keyword, size: 8 });
     } catch (e) {
       if (gen !== generation) return true;
+      setStatus(false);
       renderError('请求出错：' + String(e));
       return true;
     }
     if (gen !== generation) return true;
+    // 网络级失败在 Rust 侧也以 ok=false 返回（error 以"网络错误"开头），统一按 ok 联动状态点。
+    // 放在 stale-check 之后，避免被后续查询盖掉的旧请求回写状态点。
+    setStatus(!!j.ok);
     if (!j.ok) { renderError(j.error); return true; }
 
     const data = j.results || [];
@@ -646,21 +673,25 @@ function initMain() {
   function onExpand(toggle) {
     const raw = decodeURIComponent(toggle.dataset.raw || '');
     const abstractDiv = toggle.closest('.tb-abstract');
-    if (toggle.textContent === '展开') {
-      abstractDiv.innerHTML = esc(raw) + `<span class="tb-expand-toggle" data-raw="${encodeURIComponent(raw)}">收起</span>`;
-    } else {
-      abstractDiv.innerHTML = esc(truncate(raw, 500)) + `<span class="tb-expand-toggle" data-raw="${encodeURIComponent(raw)}">展开</span>`;
-    }
-  }
-
-  function onFooter() {
-    invoke('popup_open_external', { url: 'https://gongjushu.cnki.net/rbook/search/simplesearch?key=' + encodeURIComponent(currentKeyword) });
+    const toggleAttrs = 'role="button" tabindex="0"';
+    const label = toggle.textContent === '展开' ? '收起' : '展开';
+    const body = label === '收起' ? esc(raw) : esc(truncate(raw, 500));
+    abstractDiv.innerHTML = body + `<span class="tb-expand-toggle" ${toggleAttrs} data-raw="${encodeURIComponent(raw)}">${label}</span>`;
+    // innerHTML 重置会销毁原 toggle（可能正持有键盘焦点），重建后将焦点回填到新 toggle，
+    // 避免焦点掉到 <body> 迫使键盘用户从头重新 Tab。
+    abstractDiv.querySelector('.tb-expand-toggle')?.focus();
   }
 
   async function doSearch() {
     const word = input.value.trim();
-    if (!word) return;
-    await doLookup(word);
+    if (!word || searchBtn.disabled) return;
+    // 查询链期间禁用按钮防连点（generation 机制仍在，双保险）
+    searchBtn.disabled = true;
+    try {
+      await doLookup(word);
+    } finally {
+      searchBtn.disabled = false;
+    }
   }
 
   searchBtn.addEventListener('click', doSearch);

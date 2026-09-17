@@ -6,15 +6,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>工具书查词 · 桌面版</title>
     <script type="module" src="/main.js" defer></script>
-    <!-- 分词与繁简转换库（与浏览器扩展同源；csp:null 可直接加载，无需 sandbox iframe） -->
-    <script src="https://cdn.jsdelivr.net/npm/segmentit@2.0.3/dist/umd/segmentit.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/opencc-js@1.4.2/dist/umd/full.js"></script>
+    <!-- 分词与繁简转换库（与浏览器扩展同源；csp:null 可直接加载，无需 sandbox iframe）。
+         defer 避免阻塞首屏渲染；main.js 的 waitForSegmentit/waitForOpencc 会轮询等待其就绪 -->
+    <script defer src="https://cdn.jsdelivr.net/npm/segmentit@2.0.3/dist/umd/segmentit.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/opencc-js@1.4.2/dist/umd/full.js"></script>
   </head>
   <body>
     <!-- 主窗口 -->
     <div id="main-view" class="main-view">
-      <header class="main-topbar" data-tauri-drag-region>
-        <div class="main-brand" data-tauri-drag-region>
+      <!-- deep：整个标题栏子树均可拖拽（按钮等可交互元素自动阻断）；双击最大化由 Tauri 内置处理 -->
+      <header class="main-topbar" data-tauri-drag-region="deep">
+        <div class="main-brand">
           <img class="logo" src="/assets/crfd.svg" alt="工具书查词" />
           <span class="title">工具书查词</span>
           <span class="subtitle">CNKI 工具书 · 划词查询桌面版</span>
