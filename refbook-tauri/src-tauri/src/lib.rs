@@ -521,6 +521,73 @@ fn save_float_pos(app: &AppHandle, x: i32, y: i32) {
     }
 }
 
+/// 悬浮图标逻辑尺寸（与 float.html 的 #floating 一致），用于按当前缩放推算物理尺寸
+const FLOAT_LOGICAL_SIZE: f64 = 56.0;
+/// 悬浮图标贴边时保留的逻辑边距，避免完全贴边或被任务栏遮挡
+const FLOAT_EDGE_MARGIN: f64 = 12.0;
+
+/// 找到物理坐标 (x, y) 所在的显示器；不在任何显示器内则返回 None。
+fn monitor_at(monitors: &[tauri::Monitor], x: i32, y: i32) -> Option<tauri::Monitor> {
+    monitors.iter().find(|m| {
+        let p = m.position();
+        let s = m.size();
+        x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+    }).cloned()
+}
+
+/// 默认定位：主屏幕右下角，距边 32 逻辑像素（含显示器原点偏移）。
+fn place_float_default(float: &WebviewWindow) {
+    let Ok(Some(monitor)) = float.primary_monitor() else { return };
+    let size = monitor.size();
+    let mpos = monitor.position();
+    let scale = monitor.scale_factor();
+    // 窗口(56) + 边距(32) 逻辑像素 → 物理像素
+    let off = ((FLOAT_LOGICAL_SIZE + 32.0) * scale).round() as i32;
+    let x = mpos.x + size.width as i32 - off;
+    let y = mpos.y + size.height as i32 - off;
+    let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+}
+
+/// 用上次保存的位置定位悬浮图标，并校验整个窗口矩形仍在某显示器可见区内。
+/// 返回 true 表示成功用保存的位置定位；false 表示无保存位置或位置已越界，调用方应回退默认。
+fn place_float_from_saved(float: &WebviewWindow) -> bool {
+    let Some((sx, sy)) = load_float_pos(float.app_handle()) else { return false };
+    let monitors = float.available_monitors().ok().unwrap_or_default();
+    if monitors.is_empty() {
+        return false;
+    }
+    // 保存坐标所在（或最近的）显示器；找不到包含它的就回退默认，避免图标落到屏幕外。
+    let monitor = monitor_at(&monitors, sx, sy)
+        .or_else(|| {
+            // 越界但可能离某显示器很近（如缩放变化导致窗口溢出几像素）：选最近的
+            monitors.iter().min_by_key(|m| {
+                let p = m.position();
+                let s = m.size();
+                let cx = p.x + s.width as i32 / 2;
+                let cy = p.y + s.height as i32 / 2;
+                (sx - cx).abs() + (sy - cy).abs()
+            }).cloned()
+        });
+    let Some(monitor) = monitor else { return false };
+    let scale = monitor.scale_factor();
+    let win = FLOAT_LOGICAL_SIZE * scale; // 窗口物理尺寸
+    let margin = FLOAT_EDGE_MARGIN * scale; // 贴边安全边距（物理）
+    let p = monitor.position();
+    let s = monitor.size();
+    let min_x = p.x as f64 + margin;
+    let min_y = p.y as f64 + margin;
+    let max_x = p.x as f64 + s.width as f64 - win - margin;
+    let max_y = p.y as f64 + s.height as f64 - win - margin;
+    // 钳制：保证整个窗口（含边距）在显示器内。max<min 说明显示器太小，退回 min 端贴边。
+    let x = (sx as f64).clamp(min_x, max_x.max(min_x));
+    let y = (sy as f64).clamp(min_y, max_y.max(min_y));
+    let _ = float.set_position(Position::Physical(PhysicalPosition::new(
+        x.round() as i32,
+        y.round() as i32,
+    )));
+    true
+}
+
 /// 创建桌面悬浮图标：透明置顶小窗，可拖拽，点击唤起主窗口
 fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
     #[allow(unused_mut)] // macOS 分支不会在此变更，仅在其他平台设置透明
@@ -549,20 +616,12 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
         let _ = float.set_background_color(Some(tauri::webview::Color(15, 40, 66, 255)));
     }
 
-    // 定位：优先用上次拖动后保存的位置；否则放到主屏幕右下角（含显示器原点偏移）
-    if let Some((x, y)) = load_float_pos(app) {
-        let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
-    } else if let Ok(monitor) = float.primary_monitor() {
-        if let Some(monitor) = monitor {
-            let size = monitor.size();
-            let mpos = monitor.position();
-            let scale = monitor.scale_factor();
-            // 56(窗口) + 32(右边距) 逻辑像素 → 物理像素
-            let off = (56.0 * scale + 32.0 * scale).round() as i32;
-            let x = mpos.x + size.width as i32 - off;
-            let y = mpos.y + size.height as i32 - off;
-            let _ = float.set_position(Position::Physical(PhysicalPosition::new(x, y)));
-        }
+    // 定位：优先用上次拖动后保存的位置；否则放到主屏幕右下角。
+    // 保存的是物理坐标，但窗口物理尺寸随显示器缩放变化（56 逻辑px 在 200% 下变 112 物理px），
+    // 且分辨率/显示器布局可能已改变，因此恢复时必须校验整个窗口矩形仍在某显示器可见区内，
+    // 否则钳制到区内或回退默认位置——否则图标可能落在屏幕外无法拖回。
+    if !place_float_from_saved(&float) {
+        place_float_default(&float);
     }
     // 拖动后位置持久化：Moved 事件节流写入（500ms 内只写一次），hide 时再补写最终位置
     let app_h = app.clone();
