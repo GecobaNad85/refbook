@@ -290,15 +290,21 @@ fn show_main(app: &AppHandle) {
             });
         }
     }
-    hide_float(app);
+    hide_float(app, false);
 }
 
-/// 隐藏悬浮图标
-fn hide_float(app: &AppHandle) {
+/// 隐藏悬浮图标。
+/// `force=true` 强制隐藏（托盘菜单关闭悬浮图标）；`force=false` 为窗口联动隐藏。
+/// Wayland 下联动隐藏会让窗口 unmap，重新 show 时 KWin 重新居中放置，丢失用户拖动后的位置；
+/// 因此 Wayland 下非强制隐藏一律跳过，保持窗口 mapped 以保持位置（常驻显示策略）。
+fn hide_float(app: &AppHandle, force: bool) {
+    if !force && is_wayland() {
+        return;
+    }
     let state = app.state::<AppState>();
     let float = state.float.lock().unwrap().clone();
     if let Some(float) = float {
-        // 隐藏前补存最终位置（Wayland 下 outer_position 可能失败，则忽略）
+        // 隐藏前补存最终位置（Wayland 下 outer_position 可能失效，则忽略）
         if let Ok(pos) = float.outer_position() {
             save_float_pos(app, pos.x, pos.y);
         }
@@ -465,17 +471,18 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                 *state.float_enabled.lock().unwrap() = new_enabled;
                 let _ = float_toggle.set_checked(new_enabled);
                 if new_enabled {
-                    // 重新勾选 → 主窗口当前不可见则显示悬浮图标
+                    // 重新勾选 → 显示悬浮图标。Wayland 常驻策略下无条件显示；
+                    // X11/Windows 下仅主窗口不可见时才显示（避免与主窗口重叠）
                     let main_visible = app
                         .get_webview_window("main")
                         .map(|w| w.is_visible().unwrap_or(false))
                         .unwrap_or(false);
-                    if !main_visible {
+                    if is_wayland() || !main_visible {
                         show_float_if_enabled(app);
                     }
                 } else {
-                    // 取消勾选 → 立即隐藏悬浮图标
-                    hide_float(app);
+                    // 取消勾选 → 立即隐藏悬浮图标（强制，不受 Wayland 常驻策略影响）
+                    hide_float(app, true);
                 }
             }
             "quit" => app.exit(0),
@@ -525,6 +532,17 @@ fn save_float_pos(app: &AppHandle, x: i32, y: i32) {
 const FLOAT_LOGICAL_SIZE: f64 = 56.0;
 /// 悬浮图标贴边时保留的逻辑边距，避免完全贴边或被任务栏遮挡
 const FLOAT_EDGE_MARGIN: f64 = 12.0;
+
+/// 是否运行在 Wayland 后端。Wayland 协议不允许客户端定位顶级窗口，
+/// set_outer_position 是 no-op、outer_position 返回失效值，hide/show 间
+/// KWin 会重新居中放置窗口。因此 Wayland 下悬浮图标采用常驻策略（见 hide_float）。
+fn is_wayland() -> bool {
+    match std::env::var("GDK_BACKEND").ok().as_deref() {
+        Some("x11") => false,
+        Some("wayland") => true,
+        _ => std::env::var("WAYLAND_DISPLAY").is_ok(),
+    }
+}
 
 /// 找到物理坐标 (x, y) 所在的显示器；不在任何显示器内则返回 None。
 fn monitor_at(monitors: &[tauri::Monitor], x: i32, y: i32) -> Option<tauri::Monitor> {
@@ -638,7 +656,10 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
             }
         }
     });
-    // 初始不显示：主窗口可见时隐藏悬浮图标，主窗口关闭（隐藏到托盘）后才显示
+    // 初始不显示：主窗口可见时隐藏悬浮图标，主窗口关闭（隐藏到托盘）后才显示。
+    // Wayland 常驻策略：一旦显示就不再 hide（见 hide_float），用户拖动后位置永久保持。
+    // 注：Wayland 协议禁止客户端定位顶级窗口，初始 set_position 会被 KWin 忽略，
+    //     首次显示将落在合成器默认位置（通常居中），需用户手动拖到目标位置一次。
     Ok(())
 }
 
@@ -1649,8 +1670,9 @@ pub fn run() {
                             let _ = win.hide();
                             show_float_if_enabled(&app);
                         }
-                        // 主窗口重新获得焦点（托盘 / 任务栏 / 悬浮图标唤起）→ 隐藏悬浮图标
-                        WindowEvent::Focused(true) => hide_float(&app),
+                        // 主窗口重新获得焦点（托盘 / 任务栏 / 悬浮图标唤起）→ 隐藏悬浮图标。
+                        // Wayland 常驻策略下跳过（hide_float 内部判断），避免重新 show 时丢位置。
+                        WindowEvent::Focused(true) => hide_float(&app, false),
                         _ => {}
                     }
                 });
