@@ -701,7 +701,7 @@ fn write_kwin_rule_fields(id: &str, x: i32, y: i32) {
         ("titlematch", "1"),       // 1=精确匹配
         ("types", "1"),            // 1=Normal toplevel
         ("position", &pos),
-        ("positionrule", "2"),     // 2=Force
+        ("positionrule", "4"),     // 4=Apply initially（仅首次应用，之后允许用户拖动；2=Force 会锁定位置阻止拖动）
         ("above", "true"),
         ("aboverule", "2"),
         ("skiptaskbar", "true"),
