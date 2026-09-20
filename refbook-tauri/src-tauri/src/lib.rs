@@ -606,6 +606,155 @@ fn place_float_from_saved(float: &WebviewWindow) -> bool {
     true
 }
 
+/// 悬浮图标窗口标题（与 create_floating_icon 的 .title() 一致），用于 KWin 规则匹配
+const FLOAT_WINDOW_TITLE: &str = "工具书查词 · 悬浮图标";
+
+/// 运行命令并返回 stdout（失败返回空串）
+fn run_capture(cmd: &str, args: &[&str]) -> String {
+    std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// 运行命令，返回是否成功
+fn run_ok(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 计算悬浮图标目标位置（逻辑像素）：主屏靠右、垂直 2/3 处。
+/// x = 屏宽 - 窗口宽 - 右边距；y = 屏高 * 2/3 - 窗口高/2（窗口中心落在 2/3 线）。
+/// Wayland 下 Tauri 的 primary_monitor 返回 None（GDK 在 Wayland 不暴露主屏），
+/// 改用 `kscreen-doctor -o` 解析 KDE 显示配置，取第一个 enabled 输出的几何与缩放。
+fn compute_float_target_logical(_app: &AppHandle) -> Option<(i32, i32)> {
+    let out = run_capture("kscreen-doctor", &["-o"]);
+    if out.is_empty() {
+        return None;
+    }
+    // 去除 ANSI 颜色码
+    let clean = strip_ansi(&out);
+    // 解析所有 enabled 输出块，取第一个
+    let mut geo: Option<(i32, i32, i32, i32)> = None; // (x, y, w, h)
+    let mut in_enabled_block = false;
+    for line in clean.lines() {
+        let t = line.trim();
+        if t.starts_with("Output:") {
+            in_enabled_block = false;
+        } else if t == "enabled" {
+            in_enabled_block = true;
+        } else if in_enabled_block {
+            if let Some(rest) = t.strip_prefix("Geometry:") {
+                // 格式: "x,y WxH"
+                let rest = rest.trim();
+                let (xy, wh) = rest.split_once(' ')?;
+                let (xs, ys) = xy.split_once(',')?;
+                let (ws, hs) = wh.split_once('x')?;
+                let x = xs.trim().parse::<i32>().ok()?;
+                let y = ys.trim().parse::<i32>().ok()?;
+                let w = ws.trim().parse::<i32>().ok()?;
+                let h = hs.trim().parse::<i32>().ok()?;
+                geo = Some((x, y, w, h));
+                break;
+            }
+        }
+    }
+    let (mx, my, w, h) = geo?;
+    let x = w - FLOAT_LOGICAL_SIZE as i32 - 12;
+    let y = (h as f64 * 2.0 / 3.0 - FLOAT_LOGICAL_SIZE / 2.0).round() as i32;
+    Some((mx + x, my + y))
+}
+
+/// 去除 ANSI 转义序列（颜色码等）
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // 跳过 ESC[ ... m（或其他 CSI 序列，止于字母）
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 写入单条 KWin 规则的所有字段（按标题精确匹配，强制定位/置顶/跳过任务栏）
+fn write_kwin_rule_fields(id: &str, x: i32, y: i32) {
+    let file = "kwinrulesrc";
+    let pos = format!("{},{}", x, y);
+    let kv: &[(&str, &str)] = &[
+        ("description", "工具书悬浮图标定位"),
+        ("title", FLOAT_WINDOW_TITLE),
+        ("titlematch", "1"),       // 1=精确匹配
+        ("types", "1"),            // 1=Normal toplevel
+        ("position", &pos),
+        ("positionrule", "2"),     // 2=Force
+        ("above", "true"),
+        ("aboverule", "2"),
+        ("skiptaskbar", "true"),
+        ("skiptaskbarrule", "2"),
+    ];
+    for (k, v) in kv {
+        let _ = run_ok("kwriteconfig6", &["--file", file, "--group", id, "--key", k, v]);
+    }
+}
+
+/// KDE(KWin) 下为悬浮图标写入窗口规则，强制初始定位到主屏靠右、垂直 2/3 处。
+/// Wayland 协议禁止客户端定位 toplevel，set_position 是 no-op；KWin 窗口规则
+/// (kwinrulesrc) 是 Wayland+KDE 下唯一能控制 toplevel 初始位置的方式。
+/// 幂等：按标题查找已有规则，找到则刷新坐标（适应分辨率/缩放变化），否则追加。
+fn ensure_kwin_float_rule(app: &AppHandle) {
+    // 仅 KDE 下生效
+    if std::env::var("KDE_FULL_SESSION").ok().as_deref() != Some("true") {
+        return;
+    }
+    let Some((x, y)) = compute_float_target_logical(app) else { return };
+    let file = "kwinrulesrc";
+    // 读取现有规则 ID 列表
+    let rules = run_capture("kreadconfig6", &["--file", file, "--group", "General", "--key", "rules"]);
+    let ids: Vec<String> = rules
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // 按标题查找已有规则
+    let found = ids.iter().find(|id| {
+        run_capture("kreadconfig6", &["--file", file, "--group", id, "--key", "title"]) == FLOAT_WINDOW_TITLE
+    });
+    if let Some(id) = found {
+        // 已存在 → 刷新坐标
+        write_kwin_rule_fields(id, x, y);
+    } else {
+        // 追加新规则
+        let new_id = ids
+            .iter()
+            .map(|s| s.parse::<i32>().unwrap_or(0))
+            .max()
+            .unwrap_or(0) + 1;
+        let new_id = new_id.to_string();
+        write_kwin_rule_fields(&new_id, x, y);
+        let mut all = ids;
+        all.push(new_id);
+        let _ = run_ok("kwriteconfig6", &["--file", file, "--group", "General", "--key", "rules", &all.join(",")]);
+        let _ = run_ok("kwriteconfig6", &["--file", file, "--group", "General", "--key", "count", &(all.len() as i32).to_string()]);
+    }
+    // 重新加载 KWin 配置，让规则立即生效
+    let _ = run_ok("qdbus6", &["org.kde.KWin", "/KWin", "org.kde.KWin.reconfigure"]);
+}
+
 /// 创建桌面悬浮图标：透明置顶小窗，可拖拽，点击唤起主窗口
 fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
     #[allow(unused_mut)] // macOS 分支不会在此变更，仅在其他平台设置透明
@@ -658,8 +807,9 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
     });
     // 初始不显示：主窗口可见时隐藏悬浮图标，主窗口关闭（隐藏到托盘）后才显示。
     // Wayland 常驻策略：一旦显示就不再 hide（见 hide_float），用户拖动后位置永久保持。
-    // 注：Wayland 协议禁止客户端定位顶级窗口，初始 set_position 会被 KWin 忽略，
-    //     首次显示将落在合成器默认位置（通常居中），需用户手动拖到目标位置一次。
+    // Wayland 协议禁止客户端定位顶级窗口，set_position 会被 KWin 忽略。KDE 下通过写入
+    // KWin 窗口规则(kwinrulesrc)强制初始定位到主屏靠右、垂直 2/3 处，绕过协议限制。
+    ensure_kwin_float_rule(app);
     Ok(())
 }
 
