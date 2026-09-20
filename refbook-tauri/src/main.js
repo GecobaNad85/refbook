@@ -418,9 +418,9 @@ function initMain() {
   function renderWelcome() {
     resultsEl.innerHTML = `
       <div class="main-welcome">
-        <img class="welcome-logo" src="/assets/crfd.svg" alt="" />
+        <img class="welcome-logo" src="/assets/homelogoimg.png" alt="工具书查词" />
         <div class="welcome-title">在上方输入词目开始查询，或在任意页面选中文字后按 <b>Ctrl+Alt+D</b></div>
-        <div class="welcome-sub">整词未命中时自动分词检索；繁体词目自动转简体兜底；多分词结果以标签切换查看</div>
+        <div class="welcome-sub">在CNKI工具书中查询词条，从托盘菜单CNKI登录你的（机构）账号，使用你的订购权限查看词条全文。</div>
       </div>`;
   }
   renderWelcome();
