@@ -58,8 +58,7 @@ fn get_selection_text() -> String {
 #[cfg(target_os = "linux")]
 fn read_primary_selection() -> String {
     // Wayland 会话：原生应用（如 Chrome）的选区走 Wayland 协议，X11 读不到 → 优先 wl-paste --primary
-    if is_wayland_session() {
-        if let Some(s) = read_wayland_primary() {
+    if is_wayland_session() {        if let Some(s) = read_wayland_primary() {
             return s;
         }
         if let Some(s) = read_x11_primary() {
@@ -111,11 +110,14 @@ fn read_clipboard() -> String {
     String::new()
 }
 
-#[cfg(target_os = "linux")]
+/// 是否运行在 Wayland 会话（基于 XDG_SESSION_TYPE，WAYLAND_DISPLAY 作回退）。
+/// 用于与窗口后端无关的判断（如选区读取：wl-paste 读的是 compositor，与 app 后端无关）。
 fn is_wayland_session() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .map(|v| v.eq_ignore_ascii_case("wayland"))
-        .unwrap_or(false)
+    match std::env::var("XDG_SESSION_TYPE").ok().as_deref() {
+        Some("wayland") => true,
+        Some("x11") => false,
+        _ => std::env::var("WAYLAND_DISPLAY").is_ok(),
+    }
 }
 
 /// 执行 wl-paste 并设 1.5s 超时，避免选区所有者无响应时卡住主线程
@@ -533,14 +535,17 @@ const FLOAT_LOGICAL_SIZE: f64 = 56.0;
 /// 悬浮图标贴边时保留的逻辑边距，避免完全贴边或被任务栏遮挡
 const FLOAT_EDGE_MARGIN: f64 = 12.0;
 
-/// 是否运行在 Wayland 后端。Wayland 协议不允许客户端定位顶级窗口，
+/// Tauri/GTK 窗口是否运行在 Wayland 后端。Wayland 协议不允许客户端定位顶级窗口，
 /// set_outer_position 是 no-op、outer_position 返回失效值，hide/show 间
 /// KWin 会重新居中放置窗口。因此 Wayland 下悬浮图标采用常驻策略（见 hide_float）。
+/// 与 is_wayland_session 的区别：GDK_BACKEND 显式指定时以它为准——Wayland 会话下
+/// 若强制 GDK_BACKEND=x11（XWayland），窗口仍走 X11，set_position 可用；未指定时
+/// 复用 is_wayland_session，避免两个函数用不同启发式产生分歧。
 fn is_wayland() -> bool {
     match std::env::var("GDK_BACKEND").ok().as_deref() {
         Some("x11") => false,
         Some("wayland") => true,
-        _ => std::env::var("WAYLAND_DISPLAY").is_ok(),
+        _ => is_wayland_session(),
     }
 }
 
@@ -664,7 +669,7 @@ fn compute_float_target_logical(_app: &AppHandle) -> Option<(i32, i32)> {
         }
     }
     let (mx, my, w, h) = geo?;
-    let x = w - FLOAT_LOGICAL_SIZE as i32 - 12;
+    let x = w - FLOAT_LOGICAL_SIZE as i32 - FLOAT_EDGE_MARGIN as i32;
     let y = (h as f64 * 2.0 / 3.0 - FLOAT_LOGICAL_SIZE / 2.0).round() as i32;
     Some((mx + x, my + y))
 }
@@ -712,38 +717,83 @@ fn write_kwin_rule_fields(id: &str, x: i32, y: i32) {
     }
 }
 
+/// 读取 kwinrulesrc 文件内容（XDG_CONFIG_HOME/kwinrulesrc，回退 ~/.config/kwinrulesrc）。
+/// 失败返回空串。一次性读取整文件，避免逐 key 调 kreadconfig6（每次都是一次子进程）。
+fn read_kwinrulesrc() -> String {
+    let dir = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")));
+    let Some(dir) = dir else { return String::new() };
+    std::fs::read_to_string(format!("{dir}/kwinrulesrc")).unwrap_or_default()
+}
+
+/// 解析 kwinrulesrc（INI 格式）为 group -> {key -> value}。
+fn parse_kwinrulesrc(
+    content: &str,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let mut map: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut cur = String::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(g) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            cur = g.trim().to_string();
+            map.entry(cur.clone()).or_default();
+        } else if let Some((k, v)) = t.split_once('=') {
+            map.entry(cur.clone())
+                .or_default()
+                .insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
 /// KDE(KWin) 下为悬浮图标写入窗口规则，强制初始定位到主屏靠右、垂直 2/3 处。
 /// Wayland 协议禁止客户端定位 toplevel，set_position 是 no-op；KWin 窗口规则
 /// (kwinrulesrc) 是 Wayland+KDE 下唯一能控制 toplevel 初始位置的方式。
 /// 幂等：按标题查找已有规则，找到则刷新坐标（适应分辨率/缩放变化），否则追加。
 fn ensure_kwin_float_rule(app: &AppHandle) {
-    // 仅 KDE 下生效
-    if std::env::var("KDE_FULL_SESSION").ok().as_deref() != Some("true") {
+    // 仅 Wayland+KDE 下生效：X11 下 set_position 可用，KWin 规则会反而覆盖用户保存的位置
+    if !is_wayland() || std::env::var("KDE_FULL_SESSION").ok().as_deref() != Some("true") {
         return;
     }
     let Some((x, y)) = compute_float_target_logical(app) else { return };
     let file = "kwinrulesrc";
-    // 读取现有规则 ID 列表
-    let rules = run_capture("kreadconfig6", &["--file", file, "--group", "General", "--key", "rules"]);
-    let ids: Vec<String> = rules
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // 一次性读取并解析 kwinrulesrc，避免逐 ID 调 kreadconfig6（每个都是一次子进程）
+    let groups = parse_kwinrulesrc(&read_kwinrulesrc());
+    let ids: Vec<String> = groups
+        .get("General")
+        .and_then(|g| g.get("rules"))
+        .map(|r| {
+            r.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     // 按标题查找已有规则
     let found = ids.iter().find(|id| {
-        run_capture("kreadconfig6", &["--file", file, "--group", id, "--key", "title"]) == FLOAT_WINDOW_TITLE
+        groups
+            .get(id.as_str())
+            .and_then(|g| g.get("title"))
+            .map(|t| t.as_str())
+            == Some(FLOAT_WINDOW_TITLE)
     });
     if let Some(id) = found {
         // 已存在 → 刷新坐标
         write_kwin_rule_fields(id, x, y);
     } else {
-        // 追加新规则
+        // 追加新规则：仅取数值 ID 求最大，非数值 ID 不参与（避免它们被当成 0 抬高新 ID 导致碰撞）
         let new_id = ids
             .iter()
-            .map(|s| s.parse::<i32>().unwrap_or(0))
+            .filter_map(|s| s.parse::<i32>().ok())
             .max()
-            .unwrap_or(0) + 1;
+            .unwrap_or(0)
+            + 1;
         let new_id = new_id.to_string();
         write_kwin_rule_fields(&new_id, x, y);
         let mut all = ids;
