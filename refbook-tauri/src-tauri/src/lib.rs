@@ -15,6 +15,13 @@ struct AppState {
     float: Mutex<Option<WebviewWindow>>,
     /// 托盘"显示悬浮图标"开关：false 时即使主窗口关闭也不显示悬浮图标
     float_enabled: Mutex<bool>,
+    /// 弹窗失焦自动关窗的"武装"标志：show 后延迟 400ms 置 true，
+    /// 避开 Wayland/KDE 下窗口 show→focus 时序抖动导致弹出即自灭。
+    popup_armed: Mutex<bool>,
+    /// 弹窗 show/close 世代计数：每次 show 与手动 close 自增。延迟 arm 的线程
+    /// 醒来时发现 epoch 已被更新的 show/close 取代则放弃 arm，防止孤儿线程
+    /// 提前 arm 或给已隐藏的窗口残留 armed 状态。
+    popup_epoch: Mutex<u64>,
     /// 启动预检的 CNKI 登录态缓存：None = 尚未预检
     ///（预检由 setup 里后台任务完成，前端"查看全文"读这里，不再现建/现显窗口）
     login_cached: Mutex<Option<LoginCache>>,
@@ -214,8 +221,23 @@ fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
         .resizable(false)
         .visible(false)
         .build()
-        .ok();
-        *guard = popup;
+        .ok()?;
+        // 失焦自动关窗：armed 置位后才生效（show 后 400ms 由 show_popup_message 延迟 arm）。
+        // popup 现仅承载瞬时提示（"未检测到选中文本"等），可操作的确认对话已改走原生对话框，
+        // 因此失焦关闭不会藏掉按钮。
+        let app_h = app.clone();
+        popup.on_window_event(move |event| {
+            if let WindowEvent::Focused(false) = event {
+                let st = app_h.state::<AppState>();
+                if *st.popup_armed.lock().unwrap() {
+                    *st.popup_armed.lock().unwrap() = false;
+                    if let Some(p) = st.popup.lock().unwrap().clone() {
+                        let _ = p.hide();
+                    }
+                }
+            }
+        });
+        *guard = Some(popup);
     }
     guard.clone()
 }
@@ -223,12 +245,30 @@ fn get_or_create_popup(app: &AppHandle) -> Option<WebviewWindow> {
 /// 在弹窗中显示单条提示信息（可关闭）
 fn show_popup_message(app: &AppHandle, msg: &str, is_error: bool) {
     if let Some(win) = get_or_create_popup(app) {
+        // 重置 arm，show 后延迟 400ms 再 arm，避开窗口 show→focus 时序抖动导致自灭。
+        let state = app.state::<AppState>();
+        *state.popup_armed.lock().unwrap() = false;
+        // 记录本次 show 的 epoch；延迟 arm 线程凭它判断期间是否又有新的 show/close。
+        let epoch = {
+            let mut e = state.popup_epoch.lock().unwrap();
+            *e += 1;
+            *e
+        };
         let _ = win.set_size(LogicalSize::new(440.0, 190.0));
         center_popup(&win, 440.0, 190.0);
         let _ = win.show();
         let _ = set_focus_delayed(&win);
         let payload = serde_json::json!({"msg": msg, "isError": is_error});
         emit_popup_message(&win, payload);
+        let app_h = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let s = app_h.state::<AppState>();
+            // 期间若有新的 show/close（epoch 变化）则由那次负责 arm / 已撤销，本线程不再 arm。
+            if *s.popup_epoch.lock().unwrap() == epoch {
+                *s.popup_armed.lock().unwrap() = true;
+            }
+        });
     }
 }
 
@@ -528,6 +568,57 @@ fn save_float_pos(app: &AppHandle, x: i32, y: i32) {
         let v = serde_json::json!({ "x": x, "y": y });
         let _ = std::fs::write(&path, v.to_string());
     }
+}
+
+/// 主题偏好持久化文件（app_config_dir/theme.json）：值 "light" | "dark" | "system"
+fn theme_pref_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    Some(dir.join("theme.json"))
+}
+/// 读取主题偏好，缺省返回 "system"
+fn load_theme_pref(app: &AppHandle) -> String {
+    if let Some(path) = theme_pref_file(app) {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(s) = v.get("pref").and_then(|x| x.as_str()) {
+                    if s == "light" || s == "dark" || s == "system" {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "system".to_string()
+}
+fn save_theme_pref(app: &AppHandle, pref: &str) {
+    if let Some(path) = theme_pref_file(app) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let v = serde_json::json!({ "pref": pref });
+        // 先写临时文件再 rename，原子替换，避免写一半崩溃留下损坏文件导致偏好静默丢失
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, v.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+#[tauri::command]
+fn get_theme_pref(app: tauri::AppHandle) -> String {
+    load_theme_pref(&app)
+}
+/// 设置主题偏好：持久化并广播 theme:changed，主窗口/弹窗各自重新套用 data-theme。
+/// "system" 由前端各自用 matchMedia 解析为具体 dark/light（CSS 不写媒体查询，避免暗色变量重复）。
+#[tauri::command]
+fn set_theme_pref(app: tauri::AppHandle, pref: String) -> Result<(), String> {
+    let pref = match pref.as_str() {
+        "light" | "dark" | "system" => pref,
+        _ => return Err("invalid theme pref".into()),
+    };
+    save_theme_pref(&app, &pref);
+    let _ = app.emit("theme:changed", pref.clone());
+    Ok(())
 }
 
 /// 悬浮图标逻辑尺寸（与 float.html 的 #floating 一致），用于按当前缩放推算物理尺寸
@@ -864,8 +955,13 @@ fn create_floating_icon(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[tauri::command]
-fn popup_close(window: WebviewWindow) {
+fn popup_close(app: tauri::AppHandle, window: WebviewWindow) {
     if window.label() == "popup" {
+        // 手动关闭时撤销 arm，并推进 epoch，令任何尚在 sleep 的延迟 arm 线程
+        // 醒来后放弃置位，防止 armed 残留导致下次 show 期间误关。
+        let st = app.state::<AppState>();
+        *st.popup_armed.lock().unwrap() = false;
+        *st.popup_epoch.lock().unwrap() += 1;
         let _ = window.hide();
     }
 }
@@ -1800,6 +1896,8 @@ pub fn run() {
             popup: Mutex::new(None),
             float: Mutex::new(None),
             float_enabled: Mutex::new(true),
+            popup_armed: Mutex::new(false),
+            popup_epoch: Mutex::new(0),
             login_cached: Mutex::new(None),
             login_menu: Mutex::new(None),
             detail_busy: Mutex::new(false),
@@ -1890,6 +1988,8 @@ pub fn run() {
             cnki_detail_auth,
             cnki_logout,
             focus_main,
+            get_theme_pref,
+            set_theme_pref,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

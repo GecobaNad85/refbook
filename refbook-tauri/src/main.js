@@ -22,6 +22,54 @@ function getBookEntryUrl(item) {
   return null;
 }
 
+// ---------- 主题（light/dark/system）：Rust 持久化 + 跨窗口广播 ----------
+// "system" 由前端用 matchMedia 解析为具体 dark/light 后写 data-theme，
+// CSS 不写 prefers-color-scheme 媒体查询，暗色变量只在 [data-theme="dark"] 维护一份。
+let _themePref = 'system';
+let _userToggled = false;   // 用户手动切过主题后，忽略异步初始化返回的迟到覆盖
+let themeBtns = [];         // 主窗口页脚主题按钮（弹窗/悬浮无此元素，保持空数组）
+function resolveTheme(pref) {
+  if (pref === 'system') {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  return pref;
+}
+function applyTheme(pref) {
+  _themePref = pref;
+  document.documentElement.dataset.theme = resolveTheme(pref);
+  try { localStorage.setItem('tb-theme-pref', pref); } catch (_) {}
+}
+function setToggleActive(pref) {
+  themeBtns.forEach((b) => b.classList.toggle('active', b.dataset.themePref === pref));
+}
+function syncToggleActive(pref) {
+  if (_userToggled) return;
+  setToggleActive(pref);
+}
+// 两个窗口（main/popup）都调用：加载偏好 + 监听系统主题变化 + 监听跨窗口广播。
+// 先同步套用本地缓存/系统解析出的主题，避免 async get_theme_pref 往返前的首帧闪白
+// （尤其弹窗 440×190 无边框，Rust 先 show 再等 IPC，暗色偏好下会先闪一下浅色）。
+async function initThemeSync() {
+  let cached = null;
+  try { cached = localStorage.getItem('tb-theme-pref'); } catch (_) {}
+  if (!_userToggled) {
+    applyTheme(cached || 'system');
+    syncToggleActive(cached || 'system');
+  }
+  let pref = 'system';
+  try { pref = await invoke('get_theme_pref'); } catch (_) {}
+  if (!_userToggled) {
+    applyTheme(pref);
+    syncToggleActive(pref);
+  }
+  // 系统主题切换时，若偏好为 system 则重新解析
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (_themePref === 'system') applyTheme('system');
+  });
+  // 主窗口切换主题后 Rust 广播 theme:changed，各窗口重新套用
+  listen('theme:changed', (e) => { const p = String(e.payload || 'system'); applyTheme(p); syncToggleActive(p); });
+}
+
 // ---------- 弹窗：仅用于提示信息（查询结果在主窗口展示）----------
 let popupInited = false;
 let popupContainer = null;
@@ -30,6 +78,9 @@ let popupContainer = null;
 // 主窗口绝不能处理 popup:message——即便 Rust 侧 emit_to 已定向到 popup，
 // 也避免任何全局事件泄漏到主窗口的 popup-view（index.html 已移除该节点）。
 const isPopupWindow = window.__TAURI__.window.getCurrentWindow().label === 'popup';
+
+// 主题同步：主窗口与弹窗都要套用 data-theme（悬浮图标无主题化样式，不调用）
+initThemeSync();
 
 if (!isPopupWindow) {
   initMain();
@@ -367,19 +418,19 @@ function renderResultItem(item, idx) {
         mayHaveBtn = true;
         if (loading) {
           btnText = '加载中…';
-          abstractHtml += '<div style="color:#999;font-size:12px;margin-top:4px;">正在获取全文…</div>';
+          abstractHtml += '<div class="tb-inline-note">正在获取全文…</div>';
         } else if (item._fetchError) {
-          abstractHtml += `<div style="color:#b94a48;font-size:12px;margin-top:4px;">${esc(item._fetchError)}，可点击下方按钮重试</div>`;
+          abstractHtml += `<div class="tb-inline-error">${esc(item._fetchError)}，可点击下方按钮重试</div>`;
         }
       }
     } else if (loading) {
-      abstractHtml = '<span style="color:#999;font-size:12px;">正在获取全文…</span>';
+      abstractHtml = '<span class="tb-inline-note">正在获取全文…</span>';
       mayHaveBtn = canFetch;
       btnText = '加载中…';
     } else {
       // 全文和摘要均为空，显示提示并保留"查看全文"按钮
       const err = item._fetchError ? esc(item._fetchError) : '获取释文失败';
-      abstractHtml = `<span style="color:#b94a48;font-size:12px;">${err}，<a class="tb-book-link" role="link" tabindex="0" data-act="login">点此登录 CNKI</a> 后重试</span>`;
+      abstractHtml = `<span class="tb-inline-error">${err}，<a class="tb-book-link" role="link" tabindex="0" data-act="login">点此登录 CNKI</a> 后重试</span>`;
       mayHaveBtn = canFetch;
     }
   }
@@ -408,11 +459,26 @@ function renderResultItem(item, idx) {
 function initMain() {
   const input = document.getElementById('word-input');
   const searchBtn = document.getElementById('search-btn');
+  const tabsEl = document.getElementById('tabs');
   const resultsEl = document.getElementById('results');
+  const containerEl = document.querySelector('.main-container');
   const statusDot = document.getElementById('status-dot');
 
   // 连接状态点：绿 = 可达 CNKI API；查询级失败（网络/服务不可用）时联动变红
   function setStatus(ok) { statusDot.className = 'status ' + (ok ? 'ok' : 'bad'); }
+
+  // 页脚主题切换（浅色/深色/跟随系统）：写持久化 + 即时套用 + 反映按钮激活态。
+  // 点击即标记 _userToggled，令 initThemeSync 异步返回的旧偏好不再覆盖（避免竞态）。
+  themeBtns = [...document.querySelectorAll('.theme-toggle button[data-theme-pref]')];
+  themeBtns.forEach((b) => b.addEventListener('click', () => {
+    const pref = b.dataset.themePref;
+    _userToggled = true;
+    applyTheme(pref);          // 即时本地套用（不必等广播往返）
+    setToggleActive(pref);
+    invoke('set_theme_pref', { pref }).catch(() => {});
+  }));
+  // 初始激活态与后续广播同步由 initThemeSync 统一负责（syncToggleActive），
+  // 不再单独发起 get_theme_pref 往返，避免与用户点击竞态。
 
   // 首次启动的引导空态（发起查询后即被 loading/结果替换）
   function renderWelcome() {
@@ -448,41 +514,46 @@ function initMain() {
   let fetchInProgress = false;
 
   function setLoading(msg) {
+    tabsEl.innerHTML = '';
     resultsEl.innerHTML = '<div class="main-loading"><span class="tb-spinner"></span> ' + esc(msg) + '</div>';
   }
   function renderError(msg) {
+    tabsEl.innerHTML = '';
     resultsEl.innerHTML = '<div class="main-error">' + esc(msg || '查询失败') + '</div>';
   }
   function renderEmpty() {
+    tabsEl.innerHTML = '';
     resultsEl.innerHTML = '<div class="main-empty">在CNKI工具书总库中未找到相关释义</div>';
   }
 
-  // 渲染当前标签集（标签头横向并排 + 活动标签内容）
+  // 渲染当前标签集（标签头单独进 #tabs 粘性区，结果列表进 #results）
   function render() {
     if (tabs.length === 0) { renderEmpty(); return; }
-    const showTabs = tabs.length > 1;
-    let html = '';
-    if (showTabs) {
-      html += '<div class="tb-tabs" role="tablist">';
+    // 标签头
+    let tabsHtml = '';
+    if (tabs.length > 1) {
+      tabsHtml += '<div class="tb-tabs" role="tablist">';
       tabs.forEach((t, i) => {
         // 原词标签（index 0）即使无结果也显示；分词标签只显示有结果的
         if (i !== 0 && t.items.length === 0) return;
         const cls = i === activeIndex ? 'tb-tab active' : 'tb-tab';
         const cnt = t.items.length > 0 ? `<span class="tb-tab-count">${t.items.length}</span>` : '';
-        html += `<div class="${cls}" role="tab" tabindex="0" aria-selected="${i === activeIndex}" data-tab="${i}">${esc(t.keyword)}${cnt}</div>`;
+        tabsHtml += `<div class="${cls}" role="tab" tabindex="0" aria-selected="${i === activeIndex}" data-tab="${i}">${esc(t.keyword)}${cnt}</div>`;
       });
-      html += '</div>';
+      tabsHtml += '</div>';
     }
+    tabsEl.innerHTML = tabsHtml;
+    // 结果体
     const tab = tabs[activeIndex];
     if (!tab || tab.items.length === 0) {
-      html += '<div class="main-empty">该分词未命中结果</div>';
+      resultsEl.innerHTML = '<div class="main-empty">该分词未命中结果</div>';
     } else {
-      html += tab.items.map((item, idx) => renderResultItem(item, idx)).join('');
+      resultsEl.innerHTML = tab.items.map((item, idx) => renderResultItem(item, idx)).join('');
     }
-    resultsEl.innerHTML = html;
   }
 
-  resultsEl.onclick = (e) => {
+  // 事件委托挂在粘性区+结果的共同祖先 .main-container 上：标签在 #tabs、卡片在 #results
+  containerEl.addEventListener('click', (e) => {
     if (!(e.target instanceof Element)) return;
     // 切换标签
     const tabBtn = e.target.closest('.tb-tab');
@@ -502,10 +573,10 @@ function initMain() {
     if (loginLink) { invoke('open_cnki_login'); return; }
     const bookLink = e.target.closest('.tb-book-link');
     if (bookLink && bookLink.dataset.url) { invoke('open_entry_url', { url: bookLink.dataset.url }); return; }
-  };
+  });
 
   // 键盘可操作性：tab/展开收起/来源与登录链接均为非原生元素，Enter/空格等同点击
-  resultsEl.addEventListener('keydown', (e) => {
+  containerEl.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     const t = e.target;
     if (!(t instanceof Element)) return;

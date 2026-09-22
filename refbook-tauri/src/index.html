@@ -32,16 +32,26 @@
       </header>
 
       <main class="main-container">
-        <section class="main-search-box">
-          <input id="word-input" type="text" placeholder="输入词目，例如：Meta分析、辨证论治、循证医学…" autocomplete="off" autofocus />
-          <button id="search-btn">查 词</button>
-        </section>
+        <div class="main-sticky">
+          <section class="main-search-box">
+            <input id="word-input" type="text" placeholder="输入词目，例如：Meta分析、辨证论治、循证医学…" autocomplete="off" autofocus />
+            <button id="search-btn">查 词</button>
+          </section>
+          <section id="tabs" class="main-tabs"></section>
+        </div>
         <section id="results" class="main-results"></section>
       </main>
 
       <footer class="main-foot">
-        桌面划词：选中任意文字后按 <b>Ctrl+Alt+D</b>，自动唤起窗口查词。
-        完整释义正文可能需要机构内网或登录态。
+        <span class="foot-hint">
+          桌面划词：选中任意文字后按 <b>Ctrl+Alt+D</b>，自动唤起窗口查词。
+          完整释义正文可能需要机构内网或登录态。
+        </span>
+        <div class="theme-toggle" role="group" aria-label="主题模式">
+          <button type="button" data-theme-pref="light" title="浅色">浅色</button>
+          <button type="button" data-theme-pref="dark" title="深色">深色</button>
+          <button type="button" data-theme-pref="system" title="跟随系统主题">系统</button>
+        </div>
       </footer>
     </div>
   </body>
