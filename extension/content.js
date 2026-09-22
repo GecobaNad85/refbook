@@ -4,6 +4,35 @@ const POPUP_ID = 'cnki-refbook-popup';
 const LOADING_ID = 'cnki-refbook-loading';
 const FAB_ID = 'cnki-refbook-fab';
 
+// 提取元素文本并保留段落结构：块级元素结束与 <br> 转成换行（textContent 不反映
+// 布局，直接用会把段落黏成一行）。输出压缩 3 个以上连续换行并去首尾空白。
+function extractParagraphText(el) {
+  const BLOCK = new Set(['P', 'DIV', 'LI', 'TR', 'SECTION', 'BLOCKQUOTE',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+  let out = '';
+  (function walk(node) {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        out += child.textContent;
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        if (child.tagName === 'BR') { out += '\n'; continue; }
+        walk(child);
+        if (BLOCK.has(child.tagName)) out += '\n';
+      }
+    }
+  })(el);
+  return out.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// API 返回的释文 HTML 字符串 → 保留段落结构的纯文本（经 DOMParser 复用上面的遍历）
+function htmlToParagraphText(html) {
+  try {
+    return extractParagraphText(new DOMParser().parseFromString(html, 'text/html').body);
+  } catch (_) {
+    return html.replace(/<[^>]*>/g, '').trim();
+  }
+}
+
 // 在 gongjushu.cnki.net 页面上捕获认证凭证和条目内容
 (function captureAuthFromCnkiPage() {
   if (!window.location.hostname.endsWith('.cnki.net')) return;
@@ -25,7 +54,7 @@ const FAB_ID = 'cnki-refbook-fab';
     if (imageBox) {
       const fn = urlParams.get('filename');
       if (fn) {
-        const fullText = imageBox.textContent.trim();
+        const fullText = extractParagraphText(imageBox);
         chrome.runtime.sendMessage({
           action: 'cacheEntryContent',
           fn: fn,
@@ -40,7 +69,7 @@ const FAB_ID = 'cnki-refbook-fab';
       if (box) {
         const fn = urlParams.get('filename');
         if (fn) {
-          const fullText = box.textContent.trim();
+          const fullText = extractParagraphText(box);
           chrome.runtime.sendMessage({
             action: 'cacheEntryContent',
             fn: fn,
@@ -141,7 +170,7 @@ function injectPopupStyles() {
     #cnki-refbook-popup .cnki-tb-source { font-size: 12px; color: #888; margin-bottom: 6px; }
     #cnki-refbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
     #cnki-refbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
-    #cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
+    #cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; white-space: pre-line; }
     #cnki-refbook-popup .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     #cnki-refbook-popup .cnki-tb-tag {
       display: inline-block; font-size: 11px; color: #2347ff; background: #d0e3ff;
@@ -841,7 +870,7 @@ async function directFetchEntryDetail(item) {
         if (!data || !data.data || !data.data.length) throw new Error(`scope ${scope} 无数据`);
         const entry = data.data[0];
         const rawContent = entry.content || '';
-        const cleanContent = rawContent.replace(/<[^>]*>/g, '').trim();
+        const cleanContent = htmlToParagraphText(rawContent);
         if (!cleanContent) throw new Error(`scope ${scope} 内容为空`);
         return cleanContent;
       })

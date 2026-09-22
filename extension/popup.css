@@ -48,7 +48,7 @@
 #cnki-refbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
 #cnki-refbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
 
-#cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; }
+#cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; white-space: pre-line; }
 
 #cnki-refbook-popup .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 

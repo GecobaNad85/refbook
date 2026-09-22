@@ -202,6 +202,22 @@ function stripHtml(str) {
   return str.replace(/<[^>]*>/g, '');
 }
 
+// 条目释文 HTML → 保留段落结构的纯文本：块级标签结束与 <br> 转成换行，
+// 其余标签删除，解码常见实体，最后压缩多余空行（SW 无 DOM，用正则处理）
+function htmlToParagraphText(html) {
+  return html
+    .replace(/<br[^>]*>/gi, '\n')
+    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|section)>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function parseVSM(vsmStr) {
   if (!vsmStr) return [];
   return vsmStr.split(',').map(pair => {
@@ -315,7 +331,7 @@ async function tryEntryApiScope(fn, tablename, product, scope) {
 
   const entry = data.data[0];
   const rawContent = entry.content || '';
-  const cleanContent = rawContent.replace(/<[^>]*>/g, '').trim();
+  const cleanContent = htmlToParagraphText(rawContent);
 
   if (!cleanContent) {
     throw new Error('条目内容为空');

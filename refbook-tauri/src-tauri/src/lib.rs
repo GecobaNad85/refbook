@@ -621,6 +621,58 @@ fn set_theme_pref(app: tauri::AppHandle, pref: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 主窗口尺寸持久化文件（app_config_dir/main-window.json）：逻辑像素宽高。
+/// 只记尺寸不记位置（窗口保持 center 居中）；最大化期间不写盘，保留最近一次
+/// 正常态尺寸，避免还原后变成整屏大小。
+fn main_window_state_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("main-window.json"))
+}
+
+/// 读取上次保存的主窗口尺寸（逻辑像素），缺省或不合理（小于最小尺寸）返回 None
+fn load_main_window_size(app: &AppHandle) -> Option<(f64, f64)> {
+    let path = main_window_state_file(app)?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let w = v.get("width")?.as_f64()?;
+    let h = v.get("height")?.as_f64()?;
+    // 与 tauri.conf.json 的 minWidth/minHeight 一致，防御手改/损坏文件产生迷你窗口
+    if !(640.0..=20000.0).contains(&w) || !(480.0..=20000.0).contains(&h) {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// 保存主窗口尺寸（逻辑像素）。必须主线程调用（GTK 窗口查询要求）。
+fn save_main_window_size(win: &WebviewWindow) {
+    // 最大化/最小化/全屏时的尺寸不代表用户设定的正常态尺寸，跳过（保留上次记录）
+    if win.is_maximized().unwrap_or(false)
+        || win.is_minimized().unwrap_or(false)
+        || win.is_fullscreen().unwrap_or(false)
+    {
+        return;
+    }
+    let scale = win.scale_factor().unwrap_or(1.0);
+    // 存 outer_size、恢复也用 set_size（外框尺寸），保持同一度量，避免 GTK 装饰
+    // 导致每次重启客户区都缩小一截的累计漂移。
+    let size = match win.outer_size() {
+        Ok(s) => s.to_logical::<f64>(scale),
+        Err(_) => return,
+    };
+    if size.width < 1.0 || size.height < 1.0 {
+        return;
+    }
+    if let Some(path) = main_window_state_file(win.app_handle()) {
+        let v = serde_json::json!({ "width": size.width, "height": size.height });
+        // 与 theme.json 一致：先写临时文件再 rename 原子替换
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, v.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 /// 悬浮图标逻辑尺寸（与 float.html 的 #floating 一致），用于按当前缩放推算物理尺寸
 const FLOAT_LOGICAL_SIZE: f64 = 56.0;
 /// 悬浮图标贴边时保留的逻辑边距，避免完全贴边或被任务栏遮挡
@@ -1840,7 +1892,9 @@ async fn cnki_detail_auth(
 }
 
 /// 读取当前页面 p.image_box 的释文，返回 {exists, text}。
-/// exists=true 表示元素已在 DOM 中（页面已渲染详情页）；text 为去空白后的文本。
+/// exists=true 表示元素已在 DOM 中（页面已渲染详情页）；text 为去空白后的文本，
+/// 段落结构保留：块级元素结束与 <br> 转成换行（textContent 不反映布局，直接用
+/// 会把段落黏成一行），3 个以上连续换行压缩为两个。
 /// Rust 侧据此区分"页面未加载"（exists=false，继续轮询）与"条目无正文"（exists=true,
 /// text 空，返回空内容而非超时）。短释文（如"golden brick"）也能被接受。
 ///（eval_with_callback 把 JS 求值结果 JSON 序列化后回调给 Rust）
@@ -1848,7 +1902,19 @@ const CNKI_EVAL_EXTRACT: &str = r#"(function () {
   try {
     var box = document.querySelector('p.image_box');
     if (box) {
-      return { exists: true, text: (box.textContent || '').trim() };
+      var BLOCK = { P:1, DIV:1, LI:1, TR:1, SECTION:1, BLOCKQUOTE:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1 };
+      var out = '';
+      (function walk(node) {
+        for (var c = node.firstChild; c; c = c.nextSibling) {
+          if (c.nodeType === 3) { out += c.nodeValue; }
+          else if (c.nodeType === 1) {
+            if (c.tagName === 'BR') { out += '\n'; continue; }
+            walk(c);
+            if (BLOCK[c.tagName]) { out += '\n'; }
+          }
+        }
+      })(box);
+      return { exists: true, text: out.replace(/\n{3,}/g, '\n\n').trim() };
     }
   } catch (_) {}
   return { exists: false, text: '' };
@@ -1953,27 +2019,78 @@ pub fn run() {
 
             // 主窗口"关闭"→ 隐藏到托盘（应用常驻，可经托盘/悬浮图标/快捷键唤起）
             if let Some(main) = app.get_webview_window("main") {
+                // 恢复上次手动调整的窗口尺寸（逻辑像素），再居中保持默认定位策略。
+                // setup 在事件循环开跑/首帧绘制前执行，先 set_size 不会闪默认尺寸。
+                if let Some((w, h)) = load_main_window_size(app.handle()) {
+                    let _ = main.set_size(tauri::LogicalSize::new(w, h));
+                    let _ = main.center();
+                }
                 // 任务栏窗口图标：运行时显式设置（Linux/Windows 生效，macOS 用 .app 包内图标）
                 #[cfg(not(target_os = "macos"))]
                 if let Some(icon) = app.default_window_icon() {
                     let _ = main.set_icon(icon.clone());
                 }
+                // resize 防抖计数：连续拖拽只让最后一个事件落盘（Resized 事件极高频）。
+                // 事件处理只递增计数，落盘交给下方单个看门狗线程，避免按事件 spawn 线程
+                // （长拖拽 ~60Hz 会产生上百个睡 500ms 的线程）。
+                let resize_epoch = std::sync::Arc::new(std::sync::Mutex::new(0u64));
                 let win = main.clone();
+                let win_ev = win.clone();
+                let epoch_ev = std::sync::Arc::clone(&resize_epoch);
                 main.on_window_event(move |event| {
-                    let app = win.app_handle();
+                    let app = win_ev.app_handle();
                     match event {
                         // 主窗口"关闭"→ 隐藏到托盘，显示悬浮图标入口
                         WindowEvent::CloseRequested { api, .. } => {
                             api.prevent_close();
-                            let _ = win.hide();
+                            // 隐藏前兜底保存一次尺寸（防抖线程可能还没跑）
+                            save_main_window_size(&win_ev);
+                            let _ = win_ev.hide();
                             show_float_if_enabled(&app);
                         }
                         // 主窗口重新获得焦点（托盘 / 任务栏 / 悬浮图标唤起）→ 隐藏悬浮图标。
                         // Wayland 常驻策略下跳过（hide_float 内部判断），避免重新 show 时丢位置。
                         WindowEvent::Focused(true) => hide_float(&app, false),
+                        // 手动调整窗口大小 → 仅递增防抖计数，由看门狗线程择机落盘
+                        WindowEvent::Resized(_) => {
+                            *epoch_ev.lock().unwrap() += 1;
+                        }
                         _ => {}
                     }
                 });
+                // resize 防抖看门狗：单个常驻线程每 500ms 检查一次 epoch，仅在尺寸
+                // 稳定两个 tick（约 500ms 无变化）后落盘一次。保存须主线程
+                // （GTK 窗口查询），经 run_on_main_thread。
+                {
+                    let epoch = std::sync::Arc::clone(&resize_epoch);
+                    let win_watch = win.clone();
+                    let app_watch = win.app_handle().clone();
+                    std::thread::spawn(move || {
+                        let mut prev = 0u64;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            let cur = { *epoch.lock().unwrap() };
+                            if cur == 0 {
+                                prev = 0;
+                                continue;
+                            }
+                            if cur == prev {
+                                // 尺寸已稳定：自上一 tick 起未再变化，落盘（保存函数内部
+                                // 亦会跳过最大化/最小化/全屏）
+                                let win2 = win_watch.clone();
+                                let app2 = app_watch.clone();
+                                let epoch2 = std::sync::Arc::clone(&epoch);
+                                let _ = app2.run_on_main_thread(move || {
+                                    // 保存前再确认 epoch 未再变化，避免记录到拖拽中的中间尺寸
+                                    if *epoch2.lock().unwrap() == cur {
+                                        save_main_window_size(&win2);
+                                    }
+                                });
+                            }
+                            prev = cur;
+                        }
+                    });
+                }
             }
             Ok(())
         })
