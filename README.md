@@ -19,7 +19,7 @@
 ├── refbook-tauri/     # 桌面端原型 (Tauri):见其 README
 │
 ├── .github/workflows/  # CI:三平台安装包构建与发布
-├── icons/              # 图标设计源文件 (icon-source.png 等,非运行时)
+├── icons/              # 图标设计源文件 (crfd.svg / icon-source.png 等,非运行时)
 ├── docs/               # 设计与分析文档
 │   ├── design-analysis.md            # 划词查询工具实现分析
 │   └── traditional-chinese-fallback.md  # 繁体字查询实现思路分析
