@@ -1907,7 +1907,9 @@ async fn cnki_detail_auth(
 /// 折叠为单个空格（同浏览器 white-space:normal），只有块级边界与 <br> 才产生真正换行；
 /// 3 个以上连续 <br> 压缩为两个。
 /// 源 HTML 的 <p class="image_box"> 含嵌套 <p>/<table>，HTML 解析自动闭合外层 <p>，
-/// 使表格成为 p.image_box 的兄弟节点；因此从其**父节点**遍历以完整捕获含表格的释文。
+/// 使表格成为 p.image_box 的兄弟节点；collectEntryNodes 收集 image_box 及其后续内容
+/// 兄弟（表格等），在 .descBox（字数/来源）/ .pageBox（上下条导航）/ h3（标题）等
+/// 结构性元素处停止，仅保留释文本身，排除页面 chrome。
 /// Rust 侧据此区分"页面未加载"（exists=false，继续轮询）与"条目无正文"（exists=true,
 /// text 空，返回空内容而非超时）。短释文（如"golden brick"）也能被接受。
 ///（eval_with_callback 把 JS 求值结果 JSON 序列化后回调给 Rust）
@@ -1992,10 +1994,28 @@ const CNKI_EVAL_EXTRACT: &str = r#"(function () {
     })(node);
     return o;
   }
+  // 从 p.image_box 收集释文节点：image_box 本身 + 后续内容兄弟（表格等被 HTML 解析
+  // 提到兄弟位置）。在结构性元素处停止——字数/来源(.descBox)、上下条导航(.pageBox)、
+  // 标题(h3)——避免把释文之外的页面 chrome 误当正文。返回临时容器供 walk 遍历。
+  function collectEntryNodes(box) {
+    var frag = document.createElement('div');
+    frag.appendChild(box.cloneNode(true));
+    var sib = box.nextSibling;
+    while (sib) {
+      if (sib.nodeType === 1) {
+        var tag = sib.tagName;
+        if (tag === 'DIV' || tag === 'H3' ||
+            (tag === 'A' && /(?:^|\s)(?:prevBtn|nextBtn|aUrl)(?:\s|$)/.test(sib.className || ''))) break;
+      }
+      frag.appendChild(sib.cloneNode(true));
+      sib = sib.nextSibling;
+    }
+    return frag;
+  }
   try {
     var box = document.querySelector('p.image_box');
     if (box) {
-      var root = box.parentElement || box; // 嵌套 <p>/<table> 被 HTML 解析提到兄弟节点
+      var root = collectEntryNodes(box); // 仅释文节点，排除 .descBox/.pageBox 等
       var out = '';
       (function walk(node) {
         for (var c = node.firstChild; c; c = c.nextSibling) {

@@ -145,6 +145,27 @@ function htmlToContentHtml(html) {
   }
 }
 
+// 从 p.image_box 收集释文节点：image_box 本身 + 其后续内容兄弟节点（表格等会被 HTML
+// 解析提到兄弟位置）。在结构性元素处停止——字数/知识来源(.descBox)、上下条导航
+// (.pageBox)、标题(h3)——避免把释文之外的页面 chrome 误当正文。返回一个临时容器，
+// 供 extractContentHtml 遍历。
+function collectEntryNodes(box) {
+  const frag = document.createElement('div');
+  frag.appendChild(box.cloneNode(true));
+  let sib = box.nextSibling;
+  while (sib) {
+    if (sib.nodeType === Node.ELEMENT_NODE) {
+      const tag = sib.tagName;
+      // 块级结构性容器（descBox/pageBox/空 div）或导航链接 = 释文结束
+      if (tag === 'DIV' || tag === 'H3' ||
+          (tag === 'A' && /(?:^|\s)(?:prevBtn|nextBtn|aUrl)(?:\s|$)/.test(sib.className || ''))) break;
+    }
+    frag.appendChild(sib.cloneNode(true));
+    sib = sib.nextSibling;
+  }
+  return frag;
+}
+
 // 安全 HTML → 纯文本（去标签），用于截断判断与预览摘要
 function htmlToText(html) {
   try {
@@ -172,14 +193,14 @@ function htmlToText(html) {
     }).catch(() => {});
 
     // 2. 从 DOM 提取条目释文内容（如果存在）
-    // 源 HTML 的 <p class="image_box"> 含嵌套 <p>/<table>，HTML 解析会自动闭合外层
-    // <p>，使表格成为 p.image_box 的兄弟节点（而非子节点）。因此从其父节点遍历，
-    // 才能完整捕获释文含表格的全部内容。
+    // p.image_box 的嵌套 <p>/<table> 被 HTML 解析提到兄弟节点，collectEntryNodes
+    // 收集 image_box 及其后续内容兄弟（表格等），在 .descBox/.pageBox 等结构性
+    // 元素处停止，避免把字数/来源/上下条导航误当释文。
     const imageBox = document.querySelector('p.image_box');
     if (imageBox) {
       const fn = urlParams.get('filename');
       if (fn) {
-        const container = imageBox.parentElement || imageBox;
+        const container = collectEntryNodes(imageBox);
         const fullText = extractContentHtml(container);
         chrome.runtime.sendMessage({
           action: 'cacheEntryContent',
@@ -195,7 +216,7 @@ function htmlToText(html) {
       if (box) {
         const fn = urlParams.get('filename');
         if (fn) {
-          const container = box.parentElement || box;
+          const container = collectEntryNodes(box);
           const fullText = extractContentHtml(container);
           chrome.runtime.sendMessage({
             action: 'cacheEntryContent',

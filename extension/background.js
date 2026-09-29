@@ -493,7 +493,7 @@ async function callEntryApi(fn, tablename, invoice, nonce, product) {
 
   const entry = data.data[0];
   const rawContent = entry.content || '';
-  const cleanContent = rawContent.replace(/<[^>]*>/g, '').trim();
+  const cleanContent = htmlToContentHtml(rawContent);
 
   return { content: cleanContent };
 }
