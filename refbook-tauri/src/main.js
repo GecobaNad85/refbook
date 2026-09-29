@@ -8,6 +8,12 @@ function esc(s) {
 function truncate(str, maxLen) {
   return str.length <= maxLen ? str : str.slice(0, maxLen) + '…';
 }
+// 安全 HTML → 纯文本（去标签），用于截断判断与预览摘要
+function htmlToText(html) {
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  return (div.textContent || '').replace(/\s+/g, ' ').trim();
+}
 // 生成工具书条目链接 —— 与浏览器扩展 getBookEntryUrl 一致
 // readonlineUrl (bar.cnki.net) 校验 Referer 必须来自 *.cnki.net；桌面应用经内置 webview
 // 打开 gongjushu.cnki.net 中转页（Referer 建立），由注入脚本读取 #cnki_redirect 跳到原文页。
@@ -405,13 +411,24 @@ function renderResultItem(item, idx) {
     // 已展开：使用完整释文（如果已获取到）或摘要兜底
     const fullTextLoaded = item._fullText !== '';
     const loading = item._fetchError === '加载中…';
-    const displayText = fullTextLoaded ? item._fullText : (item.abstract || '');
-    if (displayText) {
-      if (displayText.length > 500) {
-        abstractHtml = esc(truncate(displayText, 500))
-          + `<span class="tb-expand-toggle" role="button" tabindex="0" data-raw="${encodeURIComponent(displayText)}">展开</span>`;
+    const fullHtml = item._fullText || '';   // 安全 HTML（含 <img>/<br>）
+    const abstract = item.abstract || '';     // 纯文本摘要
+    if (fullTextLoaded && fullHtml) {
+      // 全文为安全 HTML：按纯文本长度判断是否截断；截断时显示纯文本预览，展开时渲染 HTML
+      const plain = htmlToText(fullHtml);
+      if (plain.length > 500) {
+        abstractHtml = esc(truncate(plain, 500))
+          + `<span class="tb-expand-toggle" role="button" tabindex="0" data-raw="${encodeURIComponent(fullHtml)}" data-is-html="1">展开</span>`;
       } else {
-        abstractHtml = esc(displayText);
+        abstractHtml = fullHtml;
+      }
+    } else if (abstract) {
+      // 未获取到全文，用摘要兜底（纯文本）
+      if (abstract.length > 500) {
+        abstractHtml = esc(truncate(abstract, 500))
+          + `<span class="tb-expand-toggle" role="button" tabindex="0" data-raw="${encodeURIComponent(abstract)}">展开</span>`;
+      } else {
+        abstractHtml = esc(abstract);
       }
       // 全文未成功获取（仅以摘要兜底展示）时保留"查看全文"按钮供重试
       if (canFetch && !fullTextLoaded) {
@@ -724,9 +741,10 @@ function initMain() {
       });
       if (gen !== generation) return;
       // ok=true 但 content 为空：条目释文即摘要（p.image_box 无额外正文），
-      // 退回摘要作为全文，标记已加载（避免重试按钮误导用户）
+      // 退回摘要作为全文（转义为安全 HTML，与 _fullText 始终为 HTML 的约定一致），
+      // 标记已加载（避免重试按钮误导用户）
       if (d.ok && !d.content) {
-        item._fullText = item.abstract || '';
+        item._fullText = esc(item.abstract || '');
         item._fetchError = '';
       } else {
         item._fullText = d.ok ? d.content : '';
@@ -743,10 +761,19 @@ function initMain() {
   }
   function onExpand(toggle) {
     const raw = decodeURIComponent(toggle.dataset.raw || '');
+    const isHtml = toggle.dataset.isHtml === '1';
     const abstractDiv = toggle.closest('.tb-abstract');
-    const toggleAttrs = 'role="button" tabindex="0"';
+    const toggleAttrs = 'role="button" tabindex="0"' + (isHtml ? ' data-is-html="1"' : '');
     const label = toggle.textContent === '展开' ? '收起' : '展开';
-    const body = label === '收起' ? esc(raw) : esc(truncate(raw, 500));
+    let body;
+    if (label === '收起') {
+      // 展开 → 显示全部（HTML 直接渲染，纯文本转义）
+      body = isHtml ? raw : esc(raw);
+    } else {
+      // 收起 → 纯文本预览
+      const plain = isHtml ? htmlToText(raw) : raw;
+      body = esc(truncate(plain, 500));
+    }
     abstractDiv.innerHTML = body + `<span class="tb-expand-toggle" ${toggleAttrs} data-raw="${encodeURIComponent(raw)}">${label}</span>`;
     // innerHTML 重置会销毁原 toggle（可能正持有键盘焦点），重建后将焦点回填到新 toggle，
     // 避免焦点掉到 <body> 迫使键盘用户从头重新 Tab。

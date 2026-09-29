@@ -1892,29 +1892,117 @@ async fn cnki_detail_auth(
 }
 
 /// 读取当前页面 p.image_box 的释文，返回 {exists, text}。
-/// exists=true 表示元素已在 DOM 中（页面已渲染详情页）；text 为去空白后的文本，
-/// 段落结构保留：块级元素结束与 <br> 转成换行（textContent 不反映布局，直接用
-/// 会把段落黏成一行），3 个以上连续换行压缩为两个。
+/// exists=true 表示元素已在 DOM 中（页面已渲染详情页）；text 为**安全 HTML**——
+/// 保留 <img>、<table>（属性转义）与 <br>（块级元素结束/<br> 产生换行），文本节点
+/// 转义输出，可直接用于 innerHTML。文本节点内的换行是源 HTML 固定宽度的折行残留，
+/// 折叠为单个空格（同浏览器 white-space:normal），只有块级边界与 <br> 才产生真正换行；
+/// 3 个以上连续 <br> 压缩为两个。
+/// 源 HTML 的 <p class="image_box"> 含嵌套 <p>/<table>，HTML 解析自动闭合外层 <p>，
+/// 使表格成为 p.image_box 的兄弟节点；因此从其**父节点**遍历以完整捕获含表格的释文。
 /// Rust 侧据此区分"页面未加载"（exists=false，继续轮询）与"条目无正文"（exists=true,
 /// text 空，返回空内容而非超时）。短释文（如"golden brick"）也能被接受。
 ///（eval_with_callback 把 JS 求值结果 JSON 序列化后回调给 Rust）
 const CNKI_EVAL_EXTRACT: &str = r#"(function () {
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  var BLOCK = { P:1, DIV:1, LI:1, TR:1, SECTION:1, BLOCKQUOTE:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1 };
+  var TBL_INLINE = { SUP:1, SUB:1, BR:1, IMG:1, B:1, I:1, EM:1, STRONG:1, SPAN:1, A:1 };
+  function renderImg(c) {
+    var src = (c.getAttribute('src') || '').trim();
+    if (!src) return '';
+    return '<img src="' + esc(src) + '" alt="' + esc(c.getAttribute('alt') || '') + '"' +
+      (c.hasAttribute('width') ? ' width="' + esc(c.getAttribute('width')) + '"' : '') +
+      (c.hasAttribute('height') ? ' height="' + esc(c.getAttribute('height')) + '"' : '') +
+      ' style="max-width:100%;height:auto;vertical-align:middle;" loading="lazy">';
+  }
+  // 单元格内容：白名单内联标签安全重建，文本节点转义，空白折叠
+  function renderCellContent(cell) {
+    var o = '';
+    (function walk(node) {
+      for (var c = node.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) {
+          var t = c.nodeValue.replace(/\s+/g, ' ').trim();
+          if (t) o += esc(t);
+        } else if (c.nodeType === 1) {
+          var tag = c.tagName;
+          if (tag === 'BR') { o += '<br>'; continue; }
+          if (tag === 'IMG') { o += renderImg(c); continue; }
+          if (TBL_INLINE[tag]) {
+            var t = tag.toLowerCase();
+            var parts = [];
+            if (tag === 'A' && c.getAttribute('href')) {
+              var href = (c.getAttribute('href') || '').trim();
+              if (/^https?:\/\//i.test(href)) parts.push('href="' + esc(href) + '"');
+              else continue;
+            }
+            o += '<' + t + (parts.length ? ' ' + parts.join(' ') : '') + '>';
+            walk(c);
+            o += '</' + t + '>';
+          } else { walk(c); }
+        }
+      }
+    })(cell);
+    return o || '&nbsp;';
+  }
+  function renderTable(table) {
+    var o = '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;width:auto;max-width:100%;font-size:12px;margin:6px 0;">';
+    var rows = table.querySelectorAll(':scope > tbody > tr, :scope > thead > tr, :scope > tr');
+    for (var i = 0; i < rows.length; i++) {
+      o += '<tr>';
+      var cells = rows[i].querySelectorAll(':scope > th, :scope > td');
+      for (var j = 0; j < cells.length; j++) {
+        var cell = cells[j];
+        var ct = cell.tagName.toLowerCase();
+        var parts = [];
+        if (cell.hasAttribute('colspan')) parts.push('colspan="' + esc(cell.getAttribute('colspan')) + '"');
+        if (cell.hasAttribute('rowspan')) parts.push('rowspan="' + esc(cell.getAttribute('rowspan')) + '"');
+        if (cell.hasAttribute('valign')) parts.push('style="vertical-align:' + esc(cell.getAttribute('valign')) + '"');
+        o += '<' + ct + (parts.length ? ' ' + parts.join(' ') : '') + '>' + renderCellContent(cell) + '</' + ct + '>';
+      }
+      o += '</tr>';
+    }
+    return o + '</table>';
+  }
+  // 内联白名单标签安全重建（块级流中遇到时，保留标签 + 递归取子内容）
+  var INLINE = { SUP:1, SUB:1, B:1, I:1, EM:1, STRONG:1, SPAN:1 };
+  function renderInline(node) {
+    var o = '';
+    (function walk(n) {
+      for (var c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) { o += esc(c.nodeValue.replace(/\s+/g, ' ')); }
+        else if (c.nodeType === 1) {
+          var tag = c.tagName;
+          if (tag === 'BR') { o += '<br>'; continue; }
+          if (tag === 'IMG') { o += renderImg(c); continue; }
+          if (INLINE[tag]) { var t = tag.toLowerCase(); o += '<' + t + '>'; walk(c); o += '</' + t + '>'; }
+          else { walk(c); }
+        }
+      }
+    })(node);
+    return o;
+  }
   try {
     var box = document.querySelector('p.image_box');
     if (box) {
-      var BLOCK = { P:1, DIV:1, LI:1, TR:1, SECTION:1, BLOCKQUOTE:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1 };
+      var root = box.parentElement || box; // 嵌套 <p>/<table> 被 HTML 解析提到兄弟节点
       var out = '';
       (function walk(node) {
         for (var c = node.firstChild; c; c = c.nextSibling) {
-          if (c.nodeType === 3) { out += c.nodeValue; }
+          if (c.nodeType === 3) { out += esc(c.nodeValue.replace(/\s+/g, ' ')); }
           else if (c.nodeType === 1) {
-            if (c.tagName === 'BR') { out += '\n'; continue; }
+            var tag = c.tagName;
+            if (tag === 'IMG') { out += renderImg(c); continue; }
+            if (tag === 'TABLE') { out += renderTable(c); continue; }
+            if (tag === 'BR') { out += '<br>'; continue; }
+            if (INLINE[tag]) { var t = tag.toLowerCase(); out += '<' + t + '>' + renderInline(c) + '</' + t + '>'; continue; }
             walk(c);
-            if (BLOCK[c.tagName]) { out += '\n'; }
+            if (BLOCK[tag]) { out += '<br>'; }
           }
         }
-      })(box);
-      return { exists: true, text: out.replace(/\n{3,}/g, '\n\n').trim() };
+      })(root);
+      return { exists: true, text: out.replace(/(<br>\s*){3,}/gi, '<br><br>').trim() };
     }
   } catch (_) {}
   return { exists: false, text: '' };

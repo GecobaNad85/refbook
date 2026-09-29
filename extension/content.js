@@ -4,32 +4,154 @@ const POPUP_ID = 'cnki-refbook-popup';
 const LOADING_ID = 'cnki-refbook-loading';
 const FAB_ID = 'cnki-refbook-fab';
 
-// 提取元素文本并保留段落结构：块级元素结束与 <br> 转成换行（textContent 不反映
-// 布局，直接用会把段落黏成一行）。输出压缩 3 个以上连续换行并去首尾空白。
-function extractParagraphText(el) {
+// 提取元素文本为安全 HTML：保留 <img>、<table>（属性转义）与 <br>（块级标签结束/<br>
+// 产生换行），文本节点转义后输出。输出可直接用于 innerHTML（已转义，无脚本/事件等危险标签）。
+// 文本节点内的换行是源 HTML 固定宽度的折行残留，非语义换行——折叠为单个空格
+// （同浏览器 white-space:normal），只有块级边界与 <br> 才产生真正的换行。
+function extractContentHtml(el) {
   const BLOCK = new Set(['P', 'DIV', 'LI', 'TR', 'SECTION', 'BLOCKQUOTE',
     'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+  // table 内部由 renderTable 独立处理（自建安全 HTML）；表格内允许 <sup>/<sub>/<br>/<img>。
+  const TABLE_INLINE = new Set(['SUP', 'SUB', 'BR', 'IMG', 'B', 'I', 'EM', 'STRONG', 'SPAN', 'A']);
+
+  // 安全重建表格：保留结构 + colspan/rowspan/valign，单元格内递归取文本/内联标签
+  function renderTable(table) {
+    const tableAttr = ' border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;width:auto;max-width:100%;font-size:12px;margin:6px 0;"';
+    let out = '<table' + tableAttr + '>';
+    const rows = table.querySelectorAll(':scope > tbody > tr, :scope > thead > tr, :scope > tr');
+    for (const tr of rows) {
+      out += '<tr>';
+      for (const cell of tr.querySelectorAll(':scope > th, :scope > td')) {
+        const tag = cell.tagName.toLowerCase();
+        const parts = [];
+        if (cell.hasAttribute('colspan')) parts.push('colspan="' + escapeHtml(cell.getAttribute('colspan')) + '"');
+        if (cell.hasAttribute('rowspan')) parts.push('rowspan="' + escapeHtml(cell.getAttribute('rowspan')) + '"');
+        if (cell.hasAttribute('valign')) parts.push('style="vertical-align:' + escapeHtml(cell.getAttribute('valign')) + '"');
+        out += '<' + tag + (parts.length ? ' ' + parts.join(' ') : '') + '>' +
+          renderCellContent(cell) + '</' + tag + '>';
+      }
+      out += '</tr>';
+    }
+    return out + '</table>';
+  }
+  // 单元格内容：白名单内联标签安全重建，文本节点转义，空白折叠；其余标签取文本
+  function renderCellContent(cell) {
+    let out = '';
+    (function walk(node) {
+      for (const c of node.childNodes) {
+        if (c.nodeType === Node.TEXT_NODE) {
+          const t = c.textContent.replace(/\s+/g, ' ').trim();
+          if (t) out += escapeHtml(t);
+        } else if (c.nodeType === Node.ELEMENT_NODE) {
+          const tag = c.tagName;
+          if (tag === 'BR') { out += '<br>'; continue; }
+          if (tag === 'IMG') {
+            const src = (c.getAttribute('src') || '').trim();
+            if (src) out += '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(c.getAttribute('alt') || '') +
+              '" style="max-width:100%;height:auto;vertical-align:middle;" loading="lazy">';
+            continue;
+          }
+          if (TABLE_INLINE.has(tag)) {
+            const t = tag.toLowerCase();
+            const parts = [];
+            if (tag === 'A' && c.getAttribute('href')) {
+              // 仅保留 http(s) 链接，丢弃 javascript: 等
+              const href = c.getAttribute('href').trim();
+              if (/^https?:\/\//i.test(href)) parts.push('href="' + escapeHtml(href) + '"');
+              else continue;
+            }
+            out += '<' + t + (parts.length ? ' ' + parts.join(' ') : '') + '>';
+            walk(c);
+            out += '</' + t + '>';
+          } else {
+            walk(c); // 非白名单：仅取子文本
+          }
+        }
+      }
+    })(cell);
+    return out || '&nbsp;';
+  }
+
+  // 内联白名单标签安全重建（块级流中遇到时，保留标签 + 递归取子内容）。
+  const INLINE = new Set(['SUP', 'SUB', 'B', 'I', 'EM', 'STRONG', 'SPAN']);
+  function renderInline(node) {
+    let out = '';
+    (function walk(n) {
+      for (const c of n.childNodes) {
+        if (c.nodeType === Node.TEXT_NODE) {
+          out += escapeHtml(c.textContent.replace(/\s+/g, ' '));
+        } else if (c.nodeType === Node.ELEMENT_NODE) {
+          const tag = c.tagName;
+          if (tag === 'BR') { out += '<br>'; continue; }
+          if (tag === 'IMG') {
+            const src = (c.getAttribute('src') || '').trim();
+            if (src) out += '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(c.getAttribute('alt') || '') +
+              '" style="max-width:100%;height:auto;vertical-align:middle;" loading="lazy">';
+            continue;
+          }
+          if (INLINE.has(tag)) {
+            const t = tag.toLowerCase();
+            out += '<' + t + '>';
+            walk(c);
+            out += '</' + t + '>';
+          } else {
+            walk(c); // 非白名单：仅取子文本
+          }
+        }
+      }
+    })(node);
+    return out;
+  }
+
   let out = '';
   (function walk(node) {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        out += child.textContent;
+        out += escapeHtml(child.textContent.replace(/\s+/g, ' '));
       } else if (child.nodeType === Node.ELEMENT_NODE) {
-        if (child.tagName === 'BR') { out += '\n'; continue; }
+        const tag = child.tagName;
+        if (tag === 'IMG') {
+          const src = (child.getAttribute('src') || '').trim();
+          if (src) {
+            out += '<img src="' + escapeHtml(src) + '"' +
+              ' alt="' + escapeHtml(child.getAttribute('alt') || '') + '"' +
+              (child.hasAttribute('width') ? ' width="' + escapeHtml(child.getAttribute('width')) + '"' : '') +
+              (child.hasAttribute('height') ? ' height="' + escapeHtml(child.getAttribute('height')) + '"' : '') +
+              ' style="max-width:100%;height:auto;" loading="lazy">';
+          }
+          continue;
+        }
+        if (tag === 'TABLE') { out += renderTable(child); continue; }
+        if (tag === 'BR') { out += '<br>'; continue; }
+        if (INLINE.has(tag)) {
+          const t = tag.toLowerCase();
+          out += '<' + t + '>' + renderInline(child) + '</' + t + '>';
+          continue;
+        }
         walk(child);
-        if (BLOCK.has(child.tagName)) out += '\n';
+        if (BLOCK.has(tag)) out += '<br>';
       }
     }
   })(el);
-  return out.replace(/\n{3,}/g, '\n\n').trim();
+  return out.replace(/(<br>\s*){3,}/gi, '<br><br>').trim();
 }
 
-// API 返回的释文 HTML 字符串 → 保留段落结构的纯文本（经 DOMParser 复用上面的遍历）
-function htmlToParagraphText(html) {
+// API 返回的释文 HTML 字符串 → 保留 <img>/<table>/<br> 的安全 HTML（经 DOMParser）
+function htmlToContentHtml(html) {
   try {
-    return extractParagraphText(new DOMParser().parseFromString(html, 'text/html').body);
+    return extractContentHtml(new DOMParser().parseFromString(html, 'text/html').body);
   } catch (_) {
-    return html.replace(/<[^>]*>/g, '').trim();
+    return escapeHtml(html.replace(/<[^>]*>/g, '')).trim();
+  }
+}
+
+// 安全 HTML → 纯文本（去标签），用于截断判断与预览摘要
+function htmlToText(html) {
+  try {
+    return (new DOMParser().parseFromString(html, 'text/html').body.textContent || '')
+      .replace(/\s+/g, ' ').trim();
+  } catch (_) {
+    return html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
   }
 }
 
@@ -50,11 +172,15 @@ function htmlToParagraphText(html) {
     }).catch(() => {});
 
     // 2. 从 DOM 提取条目释文内容（如果存在）
+    // 源 HTML 的 <p class="image_box"> 含嵌套 <p>/<table>，HTML 解析会自动闭合外层
+    // <p>，使表格成为 p.image_box 的兄弟节点（而非子节点）。因此从其父节点遍历，
+    // 才能完整捕获释文含表格的全部内容。
     const imageBox = document.querySelector('p.image_box');
     if (imageBox) {
       const fn = urlParams.get('filename');
       if (fn) {
-        const fullText = extractParagraphText(imageBox);
+        const container = imageBox.parentElement || imageBox;
+        const fullText = extractContentHtml(container);
         chrome.runtime.sendMessage({
           action: 'cacheEntryContent',
           fn: fn,
@@ -69,7 +195,8 @@ function htmlToParagraphText(html) {
       if (box) {
         const fn = urlParams.get('filename');
         if (fn) {
-          const fullText = extractParagraphText(box);
+          const container = box.parentElement || box;
+          const fullText = extractContentHtml(container);
           chrome.runtime.sendMessage({
             action: 'cacheEntryContent',
             fn: fn,
@@ -171,6 +298,10 @@ function injectPopupStyles() {
     #cnki-refbook-popup .cnki-tb-book-link { color: #2347ff; text-decoration: none; }
     #cnki-refbook-popup .cnki-tb-book-link:hover { text-decoration: underline; }
     #cnki-refbook-popup .cnki-tb-abstract { font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 8px; white-space: pre-line; }
+    #cnki-refbook-popup .cnki-tb-abstract img { max-width: 100%; height: auto; display: block; margin: 6px 0; }
+    #cnki-refbook-popup .cnki-tb-abstract table { border-collapse: collapse; width: auto; max-width: 100%; font-size: 12px; margin: 6px 0; }
+    #cnki-refbook-popup .cnki-tb-abstract th, #cnki-refbook-popup .cnki-tb-abstract td { border: 1px solid #ccc; padding: 3px 6px; text-align: left; vertical-align: top; }
+    #cnki-refbook-popup .cnki-tb-abstract sup, #cnki-refbook-popup .cnki-tb-abstract sub { font-size: 0.8em; }
     #cnki-refbook-popup .cnki-tb-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     #cnki-refbook-popup .cnki-tb-tag {
       display: inline-block; font-size: 11px; color: #2347ff; background: #d0e3ff;
@@ -329,14 +460,24 @@ function renderResultItem(item, index) {
     mayHaveBtn = isFirst && item.fn ? true : false;
   } else if (isFirst) {
     // 已展开且是首条：使用完整释文（如果已获取到）或摘要
-    const displayText = firstResultFullText !== '' ? firstResultFullText : (item.abstract || '');
-    if (displayText) {
-      // 超过 500 字才截断，否则直接全文显示
-      if (displayText.length > 500) {
-        abstractHtml = escapeHtml(truncate(displayText, 500))
-          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(displayText)}">展开</span>`;
+    const fullHtml = firstResultFullText;      // 安全 HTML（含 <img>/<br>），空串 = 未获取
+    const abstract = item.abstract || '';        // 纯文本摘要
+    if (fullHtml) {
+      // 全文为安全 HTML：按纯文本长度判断是否截断；截断时显示纯文本预览，展开时渲染 HTML
+      const plain = htmlToText(fullHtml);
+      if (plain.length > 500) {
+        abstractHtml = escapeHtml(truncate(plain, 500))
+          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(fullHtml)}" data-is-html="1">展开</span>`;
       } else {
-        abstractHtml = escapeHtml(displayText);
+        abstractHtml = fullHtml;
+      }
+    } else if (abstract) {
+      // 未获取到全文，用摘要兜底（纯文本）
+      if (abstract.length > 500) {
+        abstractHtml = escapeHtml(truncate(abstract, 500))
+          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(abstract)}">展开</span>`;
+      } else {
+        abstractHtml = escapeHtml(abstract);
       }
     } else {
       // 全文和摘要均为空，显示提示并保留"查看全文"按钮
@@ -475,6 +616,7 @@ function setupPopupDelegation() {
       const isExpanded = e.target.textContent === '收起';
       const abstractDiv = e.target.parentElement;
       const rawText = decodeURIComponent(e.target.getAttribute('data-raw'));
+      const isHtml = e.target.getAttribute('data-is-html') === '1';
 
       // 同步 expandedFirstResult 状态，并作废进行中的异步获取，
       // 避免后到的 applyResult 覆盖用户的手动展开/收起
@@ -482,13 +624,14 @@ function setupPopupDelegation() {
       expandedFirstResult = !isExpanded;
 
       if (isExpanded) {
-        // 收起 → 回到 200 字截断
-        abstractDiv.innerHTML = escapeHtml(truncate(rawText, 200))
-          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(rawText)}">展开</span>`;
+        // 收起 → 回到 200 字截断（纯文本预览）
+        const plain = isHtml ? htmlToText(rawText) : rawText;
+        abstractDiv.innerHTML = escapeHtml(truncate(plain, 200))
+          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(rawText)}"${isHtml ? ' data-is-html="1"' : ''}>展开</span>`;
       } else {
-        // 展开 → 显示全部
-        abstractDiv.innerHTML = escapeHtml(rawText)
-          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(rawText)}">收起</span>`;
+        // 展开 → 显示全部（HTML 直接渲染，纯文本转义）
+        abstractDiv.innerHTML = (isHtml ? rawText : escapeHtml(rawText))
+          + `<span class="cnki-tb-expand-toggle" data-raw="${encodeURIComponent(rawText)}"${isHtml ? ' data-is-html="1"' : ''}>收起</span>`;
       }
       return;
     }
@@ -814,14 +957,14 @@ function fetchAndExpandFirstResult(firstItem, gen, options) {
         .then(text => applyResult(text))
         .catch(() => {
           if (gen !== searchGeneration) return;
-          // 全部失败，回退到摘要
-          applyResult(firstItem.abstract !== undefined ? firstItem.abstract : fallbackAbstract);
+          // 全部失败，回退到摘要（转义为安全 HTML，与 firstResultFullText 始终为 HTML 的约定一致）
+          applyResult(escapeHtml(firstItem.abstract !== undefined ? firstItem.abstract : fallbackAbstract));
           console.info('CNKI工具书总库：未获取到完整释文。如需查看全文，请先访问 https://gongjushu.cnki.net/ 并登录。');
         });
     })
     .catch(() => {
       if (gen !== searchGeneration) return;
-      applyResult(firstItem.abstract !== undefined ? firstItem.abstract : fallbackAbstract);
+      applyResult(escapeHtml(firstItem.abstract !== undefined ? firstItem.abstract : fallbackAbstract));
     });
 }
 
@@ -870,7 +1013,7 @@ async function directFetchEntryDetail(item) {
         if (!data || !data.data || !data.data.length) throw new Error(`scope ${scope} 无数据`);
         const entry = data.data[0];
         const rawContent = entry.content || '';
-        const cleanContent = htmlToParagraphText(rawContent);
+        const cleanContent = htmlToContentHtml(rawContent);
         if (!cleanContent) throw new Error(`scope ${scope} 内容为空`);
         return cleanContent;
       })
