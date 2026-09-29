@@ -3,7 +3,7 @@ mod cnki;
 
 use std::sync::Mutex;
 use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Position, WebviewUrl,
     WebviewWindow, WebviewWindowBuilder, WindowEvent,
@@ -531,14 +531,23 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            // macOS 托盘左键默认弹出菜单，不触发点击唤起主窗口；其余平台左键抬起唤起。
+            // 全路径引用 TrayIconEvent 等避免平台条件 import 产生的 unused 警告。
             #[cfg(not(target_os = "macos"))]
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
             {
-                show_main(tray.app_handle());
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_main(tray.app_handle());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (tray, event);
             }
         })
         .build(app)?;
