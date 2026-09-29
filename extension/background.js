@@ -202,20 +202,116 @@ function stripHtml(str) {
   return str.replace(/<[^>]*>/g, '');
 }
 
-// 条目释文 HTML → 保留段落结构的纯文本：块级标签结束与 <br> 转成换行，
-// 其余标签删除，解码常见实体，最后压缩多余空行（SW 无 DOM，用正则处理）
-function htmlToParagraphText(html) {
-  return html
-    .replace(/<br[^>]*>/gi, '\n')
-    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|section)>/gi, '\n')
+// 简易 HTML 属性/文本转义（SW 无 DOM）。转义 & < > "，输出可用于属性或文本节点。
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// 条目释文 HTML → 保留 <img>/<table>/<br> 的安全 HTML（SW 无 DOM，用正则处理）。
+// <img>/<table> 属性转义后保留；<br>/块级标签结束 → <br>；其余标签删除；文本中的换行
+// 是源 HTML 固定宽度的折行残留，折叠为单个空格。表格内保留 <sup>/<sub>/<br>/<img>。
+function htmlToContentHtml(html) {
+  const BR = '\x1F'; // 语义换行占位符（非空白，不被 \s 折叠）
+  const PH = '\x1E'; // 通用占位符前缀（img/tbl），后接序号 + \x1E
+  const phMap = []; // 顺序无关，按序号取回
+  const stash = (s) => { phMap.push(s); return PH + phMap.length + '\x1E'; };
+  const getAttr = (tag, name) => {
+    const m = tag.match(new RegExp('\\b' + name + '\\s*=\\s*("[^"]*"|\'[^\']*\'|[^\\s>]+)', 'i'));
+    return m ? m[1].replace(/^["']|["']$/g, '').trim() : '';
+  };
+  const escTxt = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // 1. 先抽出 <table>...</table>（整块替换为占位符，内部独立清洗）
+  html = html.replace(/<table\b[^>]*>[\s\S]*?<\/table>/gi, (m) => stash(cleanTable(m)));
+
+  // 2. <img> → 安全 <img> 占位符
+  html = html.replace(/<img\b[^>]*>/gi, (m) => {
+    const src = getAttr(m, 'src');
+    if (!src) return '';
+    return stash('<img src="' + escHtml(src) + '" alt="' + escHtml(getAttr(m, 'alt')) + '"' +
+      (getAttr(m, 'width') ? ' width="' + escHtml(getAttr(m, 'width')) + '"' : '') +
+      (getAttr(m, 'height') ? ' height="' + escHtml(getAttr(m, 'height')) + '"' : '') +
+      ' style="max-width:100%;height:auto;" loading="lazy">');
+  });
+
+  // 3. 内联白名单标签（sup/sub/b/i/em/strong）整对抽出为占位符（含标签对），避免被后续去标签删掉
+  const inlineRe = /<(\/?)(sup|sub|b|i|em|strong)\b[^>]*>/gi;
+  html = html.replace(inlineRe, (m) => {
+    const tag = m.toLowerCase().replace(/\s+style="[^"]*"/g, '').replace(/\s+class="[^"]*"/g, '');
+    return stash(tag); // 存 <sup>、</sup> 等，还原时直接插回
+  });
+
+  // 4. <br> / 块级结束标签 → 语义换行
+  html = html
+    .replace(/<br[^>]*>/gi, BR)
+    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|section)>/gi, BR)
+    // 5. 去除其余标签
     .replace(/<[^>]*>/g, '')
+    // 6. &nbsp; → 空格
     .replace(/&nbsp;/g, ' ')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/\n{3,}/g, '\n\n')
+    // 7. 折叠空白（含折行换行）
+    .replace(/\s+/g, ' ')
+    // 8. 语义换行 → <br>
+    .replace(new RegExp(BR, 'g'), '<br>')
+    // 9. 压缩多余 <br>
+    .replace(/(<br\s*\/?>\s*){3,}/gi, '<br><br>')
     .trim();
+
+  // 10. 还原占位符（img/table/inline）。表格还原后其内部可能仍含单元格内联标签占位符，
+  //     需循环还原至稳定（每轮 PH 占位符数递减，上限 phMap.length 轮）
+  const PH_RE = new RegExp(PH + '(\\d+)\\x1E', 'g');
+  let prev;
+  do {
+    prev = html;
+    html = html.replace(PH_RE, (_, i) => phMap[Number(i) - 1] || '');
+  } while (html !== prev);
+  return html;
+
+  // 清洗单个表格 HTML：保留结构 + colspan/rowspan/valign，单元格内仅留白名单内联标签 + 文本
+  function cleanTable(tbl) {
+    const tblAttrs = ' border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;width:auto;max-width:100%;font-size:12px;margin:6px 0;"';
+    const inlineAllowed = { sup:1, sub:1, b:1, i:1, em:1, strong:1, span:1, a:1 };
+    const cleanInline = (s) => {
+      // <br> 保留；<img> 重建；白名单内联标签保留（属性丢弃，a 仅留 http(s) href）；其余删标签留文本。
+      // 占位符用 stash()（返回 PH+序号+PH，不含 <>，不会被后续去标签/转义破坏，最终统一还原）
+      s = s.replace(/<img\b[^>]*>/gi, (m) => {
+        const src = getAttr(m, 'src');
+        if (!src) return '';
+        return stash('<img src="' + escHtml(src) + '" alt="' + escHtml(getAttr(m, 'alt')) + '" style="max-width:100%;height:auto;vertical-align:middle;" loading="lazy">');
+      }).replace(/<br\s*\/?>/gi, stash('<br>'));
+      // 白名单内联标签整对抽出为占位符（存标签本身，还原时直接插回）
+      s = s.replace(/<\/?(sup|sub|b|i|em|strong|span)\b[^>]*>/gi, (m) => stash(m.toLowerCase().replace(/\s+style="[^"]*"/g, '').replace(/\s+class="[^"]*"/g, '')));
+      s = s.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (m, attrs, inner) => {
+        const href = getAttr('<a' + attrs + '>', 'href').trim();
+        if (!/^https?:\/\//i.test(href)) return inner; // 非 http 链接：丢弃 <a>，留内容
+        return stash('<a href="' + escHtml(href) + '">') + inner + stash('</a>');
+      });
+      s = s.replace(/<[^>]*>/g, ''); // 去除其余标签
+      s = escTxt(s).replace(/\s+/g, ' ').trim() || '&nbsp;';
+      // 占位符在第 10 步统一还原（PH+序号+PH）
+      return s;
+    };
+    let out = '<table' + tblAttrs + '>';
+    const rows = tbl.match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi) || [];
+    for (const tr of rows) {
+      out += '<tr>';
+      const cells = tr.match(/<t[hd]\b[^>]*>[\s\S]*?<\/t[hd]>/gi) || [];
+      for (const cell of cells) {
+        const tag = /<th\b/i.test(cell) ? 'th' : 'td';
+        const attrs = (cell.match(/<t[hd]\b([^>]*)>/i) || [])[1] || '';
+        const parts = [];
+        const cs = getAttr('<td' + attrs + '>', 'colspan'); if (cs) parts.push('colspan="' + escHtml(cs) + '"');
+        const rs = getAttr('<td' + attrs + '>', 'rowspan'); if (rs) parts.push('rowspan="' + escHtml(rs) + '"');
+        const va = getAttr('<td' + attrs + '>', 'valign'); if (va) parts.push('style="vertical-align:' + escHtml(va) + '"');
+        const inner = (cell.match(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/i) || [])[1] || '';
+        out += '<' + tag + (parts.length ? ' ' + parts.join(' ') : '') + '>' + cleanInline(inner) + '</' + tag + '>';
+      }
+      out += '</tr>';
+    }
+    return out + '</table>';
+  }
 }
 
 function parseVSM(vsmStr) {
@@ -331,7 +427,7 @@ async function tryEntryApiScope(fn, tablename, product, scope) {
 
   const entry = data.data[0];
   const rawContent = entry.content || '';
-  const cleanContent = htmlToParagraphText(rawContent);
+  const cleanContent = htmlToContentHtml(rawContent);
 
   if (!cleanContent) {
     throw new Error('条目内容为空');

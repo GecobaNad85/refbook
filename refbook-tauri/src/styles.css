@@ -96,6 +96,10 @@ body {
 .tb-result { padding: 12px 16px; }
 .tb-word { font-size: 15px; font-weight: 600; color: var(--text-strong); margin-bottom: 4px; overflow-wrap: anywhere; }
 .tb-abstract { font-size: 13px; color: var(--text-muted); line-height: 1.6; margin-bottom: 8px; overflow-wrap: anywhere; white-space: pre-line; }
+.tb-abstract img { max-width: 100%; height: auto; display: block; margin: 6px 0; }
+.tb-abstract table { border-collapse: collapse; width: auto; max-width: 100%; font-size: 12px; margin: 6px 0; }
+.tb-abstract th, .tb-abstract td { border: 1px solid var(--border, #ccc); padding: 3px 6px; text-align: left; vertical-align: top; }
+.tb-abstract sup, .tb-abstract sub { font-size: 0.8em; }
 .tb-fulltext-btn {
   display: inline-block; margin-top: 6px; margin-bottom: 8px; padding: 4px 12px;
   font-size: 12px; color: var(--on-primary); background: var(--primary);
