@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CNKI 工具书划词查询 — a Chrome extension (Manifest V3) that lets users select text on any webpage and instantly look up definitions from CNKI's reference book database (gongjushu.cnki.net).
+工具书划词查询 — a Chrome extension (Manifest V3) that lets users select text on any webpage and instantly look up definitions from the reference book database (gongjushu.cnki.net).
 
 ## Architecture
 
@@ -14,7 +14,7 @@ Two-file extension, no build step:
   - `searchRefbook(keyword)` → POSTs to `t.cnki.net/rbook-api/v1/criteria/query`, returns parsed results (title, abstract, fn, bid, etc.)
   - `fetchFullContent(fn, bid, tablename, product)` → fetches complete entry text via `t.cnki.net/rbook-api/v1/entry/detail`, requires `invoice`/`nonce` auth tokens
   - `callEntryApi(...)` — the actual API call for entry detail; strips HTML from `content` field
-  - Auth tokens (`invoice`/`nonce`) are captured from CNKI pages (via content script), stored in memory + `chrome.storage.local`, and cleared on API auth failure
+  - Auth tokens (`invoice`/`nonce`) are captured from tool-book pages (via content script), stored in memory + `chrome.storage.local`, and cleared on API auth failure
   - Two caches: `resultCache` (search results, 5 min TTL) and `entryContentCache` (full entry text, 30 min TTL)
 
 - **`extension/content.js`** — Content script injected on all pages, handles UI and event logic:
@@ -47,7 +47,7 @@ User selects text → content.js mouseup → background.searchRefbook()
 
 No build system. Load `extension/` as an unpacked extension in `chrome://extensions` (developer mode). Changes to `background.js` require clicking "Service Worker" reload; changes to `content.js` require page refresh.
 
-## CNKI API Details
+## API Details
 
 - Search endpoint: `POST https://t.cnki.net/rbook-api/v1/criteria/query?uniplatform=NRBOOK`
 - Entry detail: `POST https://t.cnki.net/rbook-api/v1/entry/detail?uniplatform=NRBOOK`
@@ -67,7 +67,7 @@ No build system. Load `extension/` as an unpacked extension in `chrome://extensi
 - **划词选区读取**（`get_selection_text`，Linux）：**Wayland 会话优先 `wl-paste --primary`**（原生应用如 Chrome 的选区走 Wayland 协议，X11 读不到）→ X11 PRIMARY（`x11-clipboard::load`，200ms 超时，避免 `load_wait` 阻塞）→ 剪贴板（先 `wl-paste` 再 arboard）。**Wayland 下 PRIMARY 必须安装 `wl-clipboard`**，否则选区读不到（弹窗会提示"未检测到选中文本"）。`wl-paste` 经 `run_wl_paste` 带 1.5s 超时执行，避免选区所有者无响应卡住主线程。
 - **划词流程**（`trigger_selection_lookup`）：读选区 → 非空则**唤起主窗口**（`show_main` + 向主窗口 emit `main:query`，前端自动填入搜索框并查询）；选区为空则在**提示弹窗**中显示提示（可关闭）。弹窗（440×190，无边框）只承载提示信息，**不再展示查询结果**；**失焦自动关闭**（`popup_focus_armed`：show 后延迟 400ms 才武装，避免启动瞬间抢焦点误关，也保证弹窗内按钮可点）。
 - **托盘**（`create_tray`）：左键唤起主窗口（非 macOS），菜单 = 显示主窗口 / 划词查询 / **CNKI 登录**（动态文字）/ **显示悬浮图标**（`CheckMenuItem` 开关，控制悬浮图标是否允许显示）/ 退出。Ctrl+Alt+D 全局快捷键触发划词查询。
-  - **CNKI 登录菜单项动态文字**（`login_menu` + `refresh_login_menu_text`）：已登录时显示"已登录（用户名/机构）"，未登录显示"CNKI 登录…"。用户身份从 `Ecp_LoginStuts` cookie 的 JSON 值提取（`extract_display_name_from_cookies`，字段 `UserName`/`ShowName`，机构账号用 `BUserName`/`BShowName`；`ShowName` 为通用欢迎语时退回 `UserName`）。
+  - **登录菜单项动态文字**（`login_menu` + `refresh_login_menu_text`）：已登录时显示"已登录（用户名/机构）"，未登录显示"CNKI 登录…"。用户身份从 `Ecp_LoginStuts` cookie 的 JSON 值提取（`extract_display_name_from_cookies`，字段 `UserName`/`ShowName`，机构账号用 `BUserName`/`BShowName`；`ShowName` 为通用欢迎语时退回 `UserName`）。
   - **已登录时点击**：弹信息弹窗（`show_logged_in_popup` → `show_popup_actions`），显示"当前已登录 CNKI\n用户：xxx"，提供 确定/退出登录/重新登录 按钮。前端 `popup:message` 事件支持 `actions` 数组渲染按钮，点击触发 `popup_action` 命令。
   - **未登录/重新登录时点击**：打开登录窗口（`open_cnki_login`，导航到 `gongjushu.cnki.net/rbook/?tb_login=1`）。登录窗口注入 `CNKI_AUTH_INIT_SCRIPT`：提取 `.login_box_main_container` 登录表单全窗居中显示、加"CNKI 工具书 · 登录"标题条；已登录态下显示"当前已登录"提示而非暴露整页。
   - **退出登录**（`cnki_logout`）：在 cnki-auth webview 内导航到 `gongjushu.cnki.net/rbook/` 并调用页面自带的 `Ecp_LogoutOptr_my(0)`（页头"退出"按钮逻辑）——其 `$.ajax({async:false})` 同步请求 `login.cnki.net/TopLoginCore/api/loginapi/Logout`（带 `createSign` 签名 + `withCredentials`），服务端使会话失效并经 `Set-Cookie` 过期 HttpOnly 会话 cookie（`Ecp_session` 等），回调再用 JS 清 `Ecp_LoginStuts`。这是唯一能真正清掉 HttpOnly 会话 cookie 的方式（Tauri/wry 的 cookie 罐持久化落盘，`delete_cookie`/销毁窗口都清不掉已落盘 cookie）。`CNKI_EVAL_LOGOUT` 兼顾等待就绪与触发登出；复检与兜底清扫拆为 `check_login_on_main` / `sweep_and_destroy_auth`（cookie 操作留主线程、等待全部 async sleep 留异步线程，销毁落地后经 `ensure_cnki_auth_window` 重建再复检），与 `cnki_detail_auth` 共用 `detail_busy` 互斥，回填 `LoginCache` 与托盘菜单。

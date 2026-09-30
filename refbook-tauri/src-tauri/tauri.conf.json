@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "refbook-tauri",
+  "productName": "refbook",
   "version": "0.1.4",
   "identifier": "com.cnki.refbook-tauri",
   "build": {

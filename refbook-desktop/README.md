@@ -1,12 +1,12 @@
 # 工具书查词 · 桌面版（Electron 原型）
 
-CNKI 工具书划词查询的桌面端原型，参考 [nextai-translator](https://github.com/nextai-translator/nextai-translator) 的桌面架构思路实现。
+工具书划词查询的桌面端原型，参考 [nextai-translator](https://github.com/nextai-translator/nextai-translator) 的桌面架构思路实现。
 
 ## 功能
 
 - **主窗口**：手动输入词目查询，展示词条列表 + 完整释义
 - **全局划词**：选中任意文字 → 按 `Ctrl+Shift+D` → 弹窗显示查询结果
-- 复用浏览器扩展的 CNKI 查询逻辑（`searchRefbook` / `fetchEntryDetail`）
+- 复用浏览器扩展的查询逻辑（`searchRefbook` / `fetchEntryDetail`）
 
 ## 架构
 
@@ -14,7 +14,7 @@ CNKI 工具书划词查询的桌面端原型，参考 [nextai-translator](https:
 electron/
   main.js        主进程：窗口管理、全局快捷键、选区捕获、IPC
   preload.js     contextBridge 安全桥
-  cnki.js        CNKI API 查询逻辑（从 server.js 移植，纯异步函数）
+  cnki.js        工具书 API 查询逻辑（从 server.js 移植，纯异步函数）
 renderer/
   main.html/js   主窗口（手动查词）
   popup.html/js  弹窗（划词结果）

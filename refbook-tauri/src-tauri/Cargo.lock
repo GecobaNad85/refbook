@@ -2987,7 +2987,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "refbook-tauri"
+name = "refbook"
 version = "0.1.4"
 dependencies = [
  "arboard",

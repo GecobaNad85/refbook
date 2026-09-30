@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    refbook_tauri_lib::run()
+    refbook_lib::run()
 }

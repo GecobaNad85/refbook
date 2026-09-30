@@ -1,6 +1,6 @@
-# CNKI 工具书划词查询
+# 工具书划词查询
 
-在任意网页划词,即时查询 CNKI 工具书词条释义。本仓库包含浏览器扩展(核心)及两个桌面端原型。
+在任意网页划词,即时查询工具书词条释义。本仓库包含浏览器扩展(核心)及两个桌面端原型。
 
 ## 目录结构
 
@@ -33,7 +33,7 @@
 2. "加载已解压的扩展程序",选择 `extension/` 目录。
 3. 改动 `background.js` 后需在扩展页点 "Service Worker" 重载;改动 `content.js` 后刷新页面。
 
-> 完整词条全文需要 CNKI 登录凭据(`invoice`/`nonce`):先访问 `gongjushu.cnki.net` 并登录,扩展会自动捕获。详见 `CLAUDE.md`。
+> 完整词条全文需要登录凭据(`invoice`/`nonce`):先访问 `gongjushu.cnki.net` 并登录,扩展会自动捕获。详见 `CLAUDE.md`。
 
 ## 桌面端
 
